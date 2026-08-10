@@ -1,4 +1,4 @@
-﻿import win32api
+import win32api
 import win32con
 from qfluentwidgets import FluentIcon
 
@@ -132,27 +132,27 @@ class WarehouseTransferTask(BaseEfTask):
 
     def _switch_location(self, target_key: str):
         locale = self._get_locale()
-        loc_names = _LOCATIONS.get(locale, _LOCATIONS[“zh_CN”])
+        loc_names = _LOCATIONS.get(locale, _LOCATIONS["zh_CN"])
         if target_key not in loc_names:
-            raise ValueError(f”未知 location key: {target_key}”)
+            raise ValueError(f"未知 location key: {target_key}")
 
         btn = self.wait_ocr(
-            box=self.box_of_screen(0.48, 0.18, 0.52, 0.215, name=”switch_btn_area”),
+            box=self.box_of_screen(0.48, 0.18, 0.52, 0.215, name="switch_btn_area"),
             match=self.lang.WarehouseTransferTask.k_3cb6baa6,
             time_out=5,
         )
         if not btn:
-            raise RuntimeError(“未找到”仓库切换”按钮”)
+            raise RuntimeError('未找到"仓库切换"按钮')
         self.click(btn[0])
 
         target_text = loc_names[target_key]
         option = self.wait_ocr(
-            box=self.box_of_screen(0.4, 0.35, 0.75, 0.65, name=”switch_menu”),
+            box=self.box_of_screen(0.4, 0.35, 0.75, 0.65, name="switch_menu"),
             match=target_text,
             time_out=5,
         )
         if not option:
-            raise RuntimeError(f”未找到仓库选项：{target_text}”)
+            raise RuntimeError(f"未找到仓库选项：{target_text}")
         self.click(option[0])
 
         self._maybe_click_confirm()
@@ -165,25 +165,25 @@ class WarehouseTransferTask(BaseEfTask):
             if hits:
                 self.sleep(1.0)
                 self._close_switch_depot_modal()
-                self.log_info(f”仓库切换成功”)
+                self.log_info(f"仓库切换成功")
                 return
             self.sleep(0.5)
-        raise RuntimeError(“切换仓库失败：25秒内未检测到”已连接””)
+        raise RuntimeError('切换仓库失败：25秒内未检测到"已连接"')
 
     def _close_switch_depot_modal(self):
-        “””Close the Switch Depot modal by clicking its X button.”””
+        """Close the Switch Depot modal by clicking its X button."""
         # X button is at the top-right corner of the Switch Depot modal
-        close_box = self.box_of_screen(0.53, 0.05, 0.57, 0.09, name=”switch_depot_close”)
+        close_box = self.box_of_screen(0.53, 0.05, 0.57, 0.09, name="switch_depot_close")
         self.click(close_box)
         self.sleep(0.5)
         # Verify it closed by checking if the Switch Depot title is gone
         title_hits = self.ocr(
-            box=self.box_of_screen(0.05, 0.05, 0.20, 0.10, name=”switch_depot_title”),
+            box=self.box_of_screen(0.05, 0.05, 0.20, 0.10, name="switch_depot_title"),
             match=self.lang.WarehouseTransferTask.k_3cb6baa6,
         )
         if title_hits:
             # Fallback: try ESC if X click didn't work
-            self.send_key(“esc”)
+            self.send_key("esc")
             self.sleep(0.5)
 
     def _ctrl_click(self, box):
@@ -267,7 +267,7 @@ class WarehouseTransferTask(BaseEfTask):
                 time_out=5,
             )
             if not store_btn:
-                raise RuntimeError("未找到“一键存放”按钮")
+                raise RuntimeError('未找到"一键存放"按钮')
             self.click(store_btn[0])
             self._maybe_click_confirm()
             max_times -= 1
