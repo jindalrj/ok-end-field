@@ -1,3 +1,7 @@
+import json
+from pathlib import Path
+
+import cv2
 import win32api
 import win32con
 from qfluentwidgets import FluentIcon
@@ -6,6 +10,23 @@ from src.data.world_map import item_to_warehouse_dict
 from src.data.zh_en import ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH, ITEM_TRANSLATION_DICT
 from src.core.BaseEfTask import BaseEfTask
 from src.icons import Icons
+
+# Maps Chinese item name -> template image filename (without .png) in assets/items/images/
+_ITEM_TEMPLATE_DIR = Path(__file__).resolve().parents[3] / "assets" / "items" / "images"
+_ITEM_JSON = Path(__file__).resolve().parents[3] / "assets" / "items" / "item.json"
+_ITEM_TEMPLATE_MAP: dict[str, str] = {}
+
+def _load_item_template_map() -> dict[str, str]:
+    """Load Chinese name -> template filename mapping from item.json."""
+    global _ITEM_TEMPLATE_MAP
+    if _ITEM_TEMPLATE_MAP:
+        return _ITEM_TEMPLATE_MAP
+    try:
+        data = json.loads(_ITEM_JSON.read_text(encoding="utf-8"))
+        _ITEM_TEMPLATE_MAP = {v: k for k, v in data.items()}
+    except Exception:
+        _ITEM_TEMPLATE_MAP = {}
+    return _ITEM_TEMPLATE_MAP
 
 _LOCATIONS = {
     "zh_CN": {
@@ -77,13 +98,34 @@ class WarehouseTransferTask(BaseEfTask):
         _location_keys = list(_LOCATIONS.get("zh_CN", {}).keys())
         self.config_type["发货仓库"] = {"type": "drop_down", "options": _location_keys}
         self.config_type["收货仓库"] = {"type": "drop_down", "options": _location_keys}
-        # self.config_type["物品"] = {"type": "drop_down", "options": self._load_item_keys_for_dropdown()}
+        # Use all items that have template images available
+        template_map = _load_item_template_map()
+        available_items = [name for name in template_map if name in item_to_warehouse_dict]
+        if not available_items:
+            available_items = list(item_to_warehouse_dict.keys())
         self.config_type["物品"] = {
             "type": "drop_down",
-            "options": list(item_to_warehouse_dict.keys()),
+            "options": available_items,
         }
         self._template_cache: dict[str, object] = {}
         self._item_name_cache: dict[str, str] | None = None
+
+    def _load_item_template(self, item_name: str):
+        """Load the template image for an item, returning a cv2 ndarray or None."""
+        if item_name in self._template_cache:
+            return self._template_cache[item_name]
+        template_map = _load_item_template_map()
+        template_filename = template_map.get(item_name)
+        if not template_filename:
+            self._template_cache[item_name] = None
+            return None
+        template_path = _ITEM_TEMPLATE_DIR / f"{template_filename}.png"
+        if not template_path.exists():
+            self._template_cache[item_name] = None
+            return None
+        img = cv2.imread(str(template_path), cv2.IMREAD_COLOR)
+        self._template_cache[item_name] = img
+        return img
 
     def _to_one_type_page(self, item_name: str):
         category_en_name = ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH.get(item_to_warehouse_dict.get(item_name, ""), "")
@@ -232,11 +274,24 @@ class WarehouseTransferTask(BaseEfTask):
 
             ROUND = 5
             icon = None
+            item_template = self._load_item_template(item_key)
             item_key_en = ITEM_TRANSLATION_DICT.get(item_key, "")
-            if not item_key_en:
-                self.log_info(f"找不到的图标名 {item_key}")
+
             for round_idx in range(ROUND + 1):
-                icon = self.find_one(feature=item_key_en, box=search_box, threshold=0.8)
+                if item_template is not None:
+                    # Use direct template matching (resolution-independent via target_height)
+                    icon = self.find_one(
+                        feature="item_template_match",
+                        template=item_template,
+                        box=search_box,
+                        threshold=0.7,
+                        target_height=180,
+                    )
+                elif item_key_en:
+                    # Fallback: use COCO feature if no template image available
+                    icon = self.find_one(feature=item_key_en, box=search_box, threshold=0.8)
+                else:
+                    raise RuntimeError(f"No template or feature found for item: {item_key}")
                 if icon:
                     break
                 if round_idx == ROUND:
@@ -249,7 +304,18 @@ class WarehouseTransferTask(BaseEfTask):
                 raise RuntimeError(f"未找到物品图标（滚动{ROUND}轮后仍失败）：{item_key}")
             self._ctrl_click(icon)
             self.sleep(0.35)
-            icon_after = self.find_feature(feature=item_key_en, box=search_box, threshold=0.8)
+            if item_template is not None:
+                icon_after = self.find_feature(
+                    feature="item_template_match",
+                    template=item_template,
+                    box=search_box,
+                    threshold=0.7,
+                    target_height=180,
+                )
+            elif item_key_en:
+                icon_after = self.find_feature(feature=item_key_en, box=search_box, threshold=0.8)
+            else:
+                icon_after = None
             if not icon_after:
                 self.log_info(f"物品图标已消失（可能已倒完）：{item_key}")
                 # count_after = self._read_count_near_icon(icon_after)
