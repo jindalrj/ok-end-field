@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import cv2
+import numpy as np
 import win32api
 import win32con
 from qfluentwidgets import FluentIcon
@@ -10,6 +11,7 @@ from src.data.world_map import item_to_warehouse_dict
 from src.data.zh_en import ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH, ITEM_TRANSLATION_DICT
 from src.core.BaseEfTask import BaseEfTask
 from src.icons import Icons
+from src.ocr import ocr_text, ocr_match, ensure_tesseract
 
 # Maps Chinese item name -> template image filename (without .png) in assets/items/images/
 _ITEM_TEMPLATE_DIR = Path(__file__).resolve().parents[3] / "assets" / "items" / "images"
@@ -145,13 +147,30 @@ class WarehouseTransferTask(BaseEfTask):
         return "zh_CN"
 
     def _detect_current_location(self) -> str | None:
-        """Try OCR detection, but return None gracefully if OCR doesn't work."""
+        """Detect current depot location using Tesseract OCR (primary) with framework OCR fallback."""
         self.next_frame()
-        detect_box = self.box_of_screen(0.02, 0.03, 0.22, 0.10, name="current_location_area")
-        boxes = self.ocr(box=detect_box, threshold=0.1)
         locale = self._get_locale()
         detect_map = _LOCATION_DETECT.get(locale, _LOCATION_DETECT["zh_CN"])
+        frame = self.executor.frame
 
+        # Primary: Tesseract OCR on the title region
+        if frame is not None:
+            h, w = frame.shape[:2]
+            # Title area: "Valley IV Depot" / "武陵仓库" at ~(0.10, 0.17) to (0.29, 0.23)
+            title_box = (int(w * 0.10), int(h * 0.17), int(w * 0.29), int(h * 0.23))
+            text = ocr_text(frame, box=title_box, psm=6)
+            if text:
+                self.log_info(f"[detect_location] Tesseract: '{text}'")
+                for loc_key, pattern in detect_map.items():
+                    if isinstance(pattern, tuple):
+                        if all(part.lower() in text.lower() for part in pattern):
+                            return loc_key
+                    elif pattern.lower() in text.lower():
+                        return loc_key
+
+        # Fallback: framework OCR (works for Chinese)
+        detect_box = self.box_of_screen(0.02, 0.03, 0.29, 0.23, name="current_location_area")
+        boxes = self.ocr(box=detect_box, threshold=0.1)
         all_texts = []
         for box in boxes or []:
             text = str(getattr(box, "name", "")).strip()
@@ -159,19 +178,8 @@ class WarehouseTransferTask(BaseEfTask):
                 all_texts.append(text)
         combined_text = " ".join(all_texts)
         if all_texts:
-            self.log_info(f"[detect_location] OCR texts={all_texts}")
+            self.log_info(f"[detect_location] framework OCR: {all_texts}")
 
-        # Per-box matching
-        for box in boxes or []:
-            name = str(getattr(box, "name", "")).strip()
-            for loc_key, pattern in detect_map.items():
-                if isinstance(pattern, tuple):
-                    if all(part in name for part in pattern):
-                        return loc_key
-                elif pattern in name:
-                    return loc_key
-
-        # Combined text matching
         for loc_key, pattern in detect_map.items():
             if isinstance(pattern, tuple):
                 if all(part in combined_text for part in pattern):
@@ -181,9 +189,22 @@ class WarehouseTransferTask(BaseEfTask):
         return None
 
     def _maybe_click_confirm(self):
-        """Click Confirm button if it appears (positional click with OCR fallback)."""
-        # Try OCR first
+        """Click Confirm button if it appears (Tesseract primary, positional fallback)."""
         confirm_text = self.lang.WarehouseTransferTask.k_b56d9ac6
+        self.next_frame()
+        frame = self.executor.frame
+
+        # Try Tesseract first
+        if frame is not None:
+            h, w = frame.shape[:2]
+            confirm_box = (int(w * 0.78), int(h * 0.84), int(w * 0.97), int(h * 0.97))
+            if ocr_match(frame, confirm_box, confirm_text):
+                self.log_info(f"[confirm] Tesseract found '{confirm_text}', clicking")
+                self.click_relative(0.88, 0.91)
+                self.sleep(0.5)
+                return True
+
+        # Try framework OCR
         hits = self.wait_ocr(
             box=self.box_of_screen(0.78, 0.84, 0.97, 0.97, name="confirm_btn_area"),
             match=confirm_text,
@@ -191,12 +212,12 @@ class WarehouseTransferTask(BaseEfTask):
             raise_if_not_found=False,
         )
         if hits:
-            self.log_info(f"[confirm] found via OCR, clicking")
+            self.log_info(f"[confirm] framework OCR found, clicking")
             self.click(hits[0])
             self.sleep(0.5)
             return True
-        # Positional fallback: click where Confirm button appears
-        # From screenshots: yellow Confirm button at ~(0.88, 0.91)
+
+        # Positional fallback
         self.log_info("[confirm] OCR missed, clicking confirm position")
         self.click_relative(0.88, 0.91)
         self.sleep(0.5)
@@ -209,59 +230,91 @@ class WarehouseTransferTask(BaseEfTask):
             raise ValueError(f"未知 location key: {target_key}")
 
         # Step 1: Click the Switch Depot button (teal pill in depot header)
-        # From screenshots: center ~(0.26, 0.06)
         switch_text = self.lang.WarehouseTransferTask.k_3cb6baa6
         self.log_info(f"[switch] clicking Switch Depot button, locale={locale}")
         btn = self.wait_ocr(
             box=self.box_of_screen(0.20, 0.03, 0.35, 0.10, name="switch_btn_area"),
             match=switch_text,
-            time_out=3,
+            time_out=2,
             raise_if_not_found=False,
         )
         if btn:
             self.click(btn[0])
         else:
-            self.log_info("[switch] OCR missed button, using positional click")
+            self.log_info("[switch] framework OCR missed, using positional click")
             self.click_relative(0.26, 0.06)
         self.sleep(1.0)
 
-        # Step 2: Click the target depot option in the modal
-        # From screenshots: Wuling ~(0.35, 0.14), Valley IV ~(0.35, 0.18)
+        # Step 2: Click the target depot in the modal
+        # Positions: Wuling ~(0.35, 0.14), Valley IV ~(0.35, 0.18)
         _OPTION_POSITIONS = {"wuling": 0.14, "valley4": 0.18}
         target_text = loc_names[target_key]
         self.log_info(f"[switch] selecting depot '{target_text}'")
-        option = self.wait_ocr(
-            box=self.box_of_screen(0.15, 0.08, 0.55, 0.30, name="switch_menu"),
-            match=target_text,
-            time_out=3,
-            raise_if_not_found=False,
-        )
-        if option:
-            self.click(option[0])
-        else:
+
+        # Try Tesseract to find the target depot name in modal
+        clicked_target = False
+        self.next_frame()
+        frame = self.executor.frame
+        if frame is not None:
+            from src.ocr import ocr_frame
+            h, w = frame.shape[:2]
+            modal_box = (int(w * 0.15), int(h * 0.08), int(w * 0.55), int(h * 0.30))
+            detections = ocr_frame(frame, box=modal_box, psm=6)
+            for det in detections:
+                if target_text.lower() in det["text"].lower():
+                    # Click center of detected text
+                    cx = det["x"] + det["w"] // 2
+                    cy = det["y"] + det["h"] // 2
+                    self.log_info(f"[switch] Tesseract found '{det['text']}' at ({cx},{cy})")
+                    self.click_relative(cx / w, cy / h)
+                    clicked_target = True
+                    break
+
+        if not clicked_target:
+            # Fallback: framework OCR
+            option = self.wait_ocr(
+                box=self.box_of_screen(0.15, 0.08, 0.55, 0.30, name="switch_menu"),
+                match=target_text,
+                time_out=2,
+                raise_if_not_found=False,
+            )
+            if option:
+                self.click(option[0])
+                clicked_target = True
+
+        if not clicked_target:
             option_y = _OPTION_POSITIONS.get(target_key, 0.16)
-            self.log_info(f"[switch] OCR missed option, using positional click y={option_y}")
+            self.log_info(f"[switch] OCR missed, positional click y={option_y}")
             self.click_relative(0.35, option_y)
         self.sleep(0.5)
 
         # Step 3: Click Confirm if it appears
         self._maybe_click_confirm()
 
-        # Step 4: Wait for connection (try OCR, fall back to fixed wait)
+        # Step 4: Wait for "Connected" using Tesseract
         connected_text = self.lang.WarehouseTransferTask.k_65fe35c4
-        self.log_info(f"[switch] waiting for connection...")
+        self.log_info(f"[switch] waiting for '{connected_text}'...")
         connected = False
-        for i in range(20):
+        for i in range(15):
             self.next_frame()
-            hits = self.ocr(box=self.box.bottom_right, match=connected_text, threshold=0.1)
+            frame = self.executor.frame
+            if frame is not None:
+                h, w = frame.shape[:2]
+                # Connected button at bottom-right of modal ~(0.78, 0.84) to (0.97, 0.97)
+                conn_box = (int(w * 0.78), int(h * 0.84), int(w * 0.97), int(h * 0.97))
+                if ocr_match(frame, conn_box, connected_text):
+                    self.log_info(f"[switch] Tesseract detected '{connected_text}' after {i} polls")
+                    connected = True
+                    break
+            # Also try framework OCR
+            hits = self.ocr(box=self.box_of_screen(0.78, 0.84, 0.97, 0.97), match=connected_text, threshold=0.1)
             if hits:
-                self.log_info(f"[switch] connected detected after {i} polls")
+                self.log_info(f"[switch] framework OCR detected connected after {i} polls")
                 connected = True
                 break
             self.sleep(0.5)
         if not connected:
-            # OCR may not work for English — just wait a fixed time
-            self.log_info("[switch] OCR didn't detect 'Connected', waiting fixed 5s")
+            self.log_info("[switch] neither OCR detected 'Connected', waiting 5s")
             self.sleep(5.0)
 
         # Step 5: Close the Switch Depot modal
@@ -293,6 +346,11 @@ class WarehouseTransferTask(BaseEfTask):
 
     def run(self):
         self.ensure_main()
+        try:
+            ensure_tesseract()
+            self.log_info("[run] Tesseract OCR initialized")
+        except Exception as e:
+            self.log_info(f"[run] Tesseract not available ({e}), using positional clicks only")
 
         from_key = str(self.config.get("发货仓库", "wuling")).strip()
         to_key = str(self.config.get("收货仓库", "valley4")).strip()
@@ -381,18 +439,33 @@ class WarehouseTransferTask(BaseEfTask):
 
             store_text = self.lang.WarehouseTransferTask.k_d661f6da
             self.log_info(f"[store] clicking Quick Stash")
-            store_btn = self.wait_ocr(
-                box=self.box_of_screen(0.78, 0.84, 0.97, 0.97, name="onekey_store_area"),
-                match=store_text,
-                time_out=3,
-                raise_if_not_found=False,
-            )
-            if store_btn:
-                self.click(store_btn[0])
-            else:
-                # Positional fallback: Quick Stash at ~(0.87, 0.90)
+            # Try Tesseract to verify Quick Stash button is visible
+            self.next_frame()
+            frame = self.executor.frame
+            store_found = False
+            if frame is not None:
+                h, w = frame.shape[:2]
+                store_box = (int(w * 0.78), int(h * 0.84), int(w * 0.97), int(h * 0.97))
+                if ocr_match(frame, store_box, store_text):
+                    self.log_info("[store] Tesseract confirmed Quick Stash visible")
+                    store_found = True
+
+            if not store_found:
+                # Try framework OCR
+                store_btn = self.wait_ocr(
+                    box=self.box_of_screen(0.78, 0.84, 0.97, 0.97, name="onekey_store_area"),
+                    match=store_text,
+                    time_out=2,
+                    raise_if_not_found=False,
+                )
+                if store_btn:
+                    self.click(store_btn[0])
+                    store_found = True
+
+            if not store_found:
                 self.log_info("[store] OCR missed, using positional click")
-                self.click_relative(0.87, 0.90)
+            # Click Quick Stash position regardless (confirmed visible or positional)
+            self.click_relative(0.87, 0.90)
             self._maybe_click_confirm()
             max_times -= 1
             if max_times <= 0:

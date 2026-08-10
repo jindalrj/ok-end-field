@@ -16,6 +16,7 @@ dependencies = [
     "pyautogui==0.9.54",
     "scikit-image==0.26.0",
     "playwright==1.57.0",
+    "pytesseract==0.3.13",
 ]
 
 [dependency-groups]

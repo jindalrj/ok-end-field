@@ -99,6 +99,8 @@ pyside6-fluent-widgets==1.11.3
     # via ok-script
 pysidesix-frameless-window==0.8.2
     # via pyside6-fluent-widgets
+pytesseract==0.3.13
+    # via ok-end-field (pyproject.toml)
 pytweening==1.2.0
     # via pyautogui
 pywavelets==1.9.0
