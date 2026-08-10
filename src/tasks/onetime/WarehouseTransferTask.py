@@ -145,7 +145,7 @@ class WarehouseTransferTask(BaseEfTask):
         return "zh_CN"
 
     def _detect_current_location(self) -> str | None:
-        detect_box = self.box_of_screen(0.10, 0.15, 0.35, 0.25, name="current_location_area")
+        detect_box = self.box_of_screen(0.02, 0.03, 0.22, 0.10, name="current_location_area")
         boxes = self.ocr(box=detect_box)
         locale = self._get_locale()
         detect_map = _LOCATION_DETECT.get(locale, _LOCATION_DETECT["zh_CN"])
@@ -190,7 +190,7 @@ class WarehouseTransferTask(BaseEfTask):
         confirm_text = self.lang.WarehouseTransferTask.k_b56d9ac6
         self.log_info(f"[confirm] looking for '{confirm_text}' in bottom-right area")
         hits = self.wait_ocr(
-            box=self.box_of_screen(0.79, 0.88, 0.95, 0.97, name="confirm_btn_area"),
+            box=self.box_of_screen(0.78, 0.84, 0.97, 0.97, name="confirm_btn_area"),
             match=confirm_text,
             time_out=3,
             raise_if_not_found=False,
@@ -212,13 +212,13 @@ class WarehouseTransferTask(BaseEfTask):
         switch_text = self.lang.WarehouseTransferTask.k_3cb6baa6
         self.log_info(f"[switch] looking for switch button '{switch_text}' locale={locale}")
         btn = self.wait_ocr(
-            box=self.box_of_screen(0.40, 0.15, 0.60, 0.25, name="switch_btn_area"),
+            box=self.box_of_screen(0.20, 0.03, 0.35, 0.10, name="switch_btn_area"),
             match=switch_text,
             time_out=5,
         )
         if not btn:
             # Debug: scan wider area to see what OCR finds
-            wide_boxes = self.ocr(box=self.box_of_screen(0.30, 0.10, 0.70, 0.30, name="switch_btn_debug"))
+            wide_boxes = self.ocr(box=self.box_of_screen(0.10, 0.02, 0.50, 0.12, name="switch_btn_debug"))
             debug_texts = [str(getattr(b, "name", "")) for b in (wide_boxes or [])]
             self.log_info(f"[switch] button NOT found. Wide scan OCR: {debug_texts}")
             raise RuntimeError(f'未找到"{switch_text}"按钮')
@@ -228,13 +228,13 @@ class WarehouseTransferTask(BaseEfTask):
         target_text = loc_names[target_key]
         self.log_info(f"[switch] looking for menu option '{target_text}'")
         option = self.wait_ocr(
-            box=self.box_of_screen(0.3, 0.30, 0.75, 0.70, name="switch_menu"),
+            box=self.box_of_screen(0.15, 0.08, 0.55, 0.30, name="switch_menu"),
             match=target_text,
             time_out=5,
         )
         if not option:
             # Debug: scan menu area
-            menu_boxes = self.ocr(box=self.box_of_screen(0.3, 0.30, 0.75, 0.70, name="switch_menu_debug"))
+            menu_boxes = self.ocr(box=self.box_of_screen(0.15, 0.08, 0.55, 0.30, name="switch_menu_debug"))
             debug_texts = [str(getattr(b, "name", "")) for b in (menu_boxes or [])]
             self.log_info(f"[switch] option NOT found. Menu OCR: {debug_texts}")
             raise RuntimeError(f"未找到仓库选项：{target_text}")
@@ -262,13 +262,13 @@ class WarehouseTransferTask(BaseEfTask):
     def _close_switch_depot_modal(self):
         """Close the Switch Depot modal by clicking its X button."""
         self.log_info("[close_modal] attempting to close Switch Depot modal via X button")
-        close_box = self.box_of_screen(0.53, 0.05, 0.57, 0.09, name="switch_depot_close")
+        close_box = self.box_of_screen(0.52, 0.04, 0.56, 0.08, name="switch_depot_close")
         self.click(close_box)
         self.sleep(0.5)
         # Verify it closed by checking if the Switch Depot title is gone
         switch_text = self.lang.WarehouseTransferTask.k_3cb6baa6
         title_hits = self.ocr(
-            box=self.box_of_screen(0.30, 0.10, 0.70, 0.25, name="switch_depot_title"),
+            box=self.box_of_screen(0.05, 0.03, 0.25, 0.10, name="switch_depot_title"),
             match=switch_text,
         )
         if title_hits:
@@ -379,13 +379,19 @@ class WarehouseTransferTask(BaseEfTask):
             self.log_info(f"切换到收货仓库={to_key}")
             self._switch_location(to_key)
 
+            store_text = self.lang.WarehouseTransferTask.k_d661f6da
+            self.log_info(f"[store] looking for '{store_text}' button")
             store_btn = self.wait_ocr(
-                box=self.box_of_screen(0.64, 0.705, 0.69, 0.735, name="onekey_store_area"),
-                match=self.lang.WarehouseTransferTask.k_d661f6da,
+                box=self.box_of_screen(0.78, 0.84, 0.97, 0.97, name="onekey_store_area"),
+                match=store_text,
                 time_out=5,
             )
             if not store_btn:
-                raise RuntimeError('未找到"一键存放"按钮')
+                # Debug: scan area
+                store_debug = self.ocr(box=self.box_of_screen(0.60, 0.80, 1.0, 1.0, name="store_debug"))
+                debug_texts = [str(getattr(b, "name", "")) for b in (store_debug or [])]
+                self.log_info(f"[store] NOT found. Bottom-right OCR: {debug_texts}")
+                raise RuntimeError(f'未找到"{store_text}"按钮')
             self.click(store_btn[0])
             self._maybe_click_confirm()
             max_times -= 1
