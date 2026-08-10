@@ -15,7 +15,7 @@ from ._lang_typed import _LangAccessorTyped
 ACTIVE_LOCALES_CONFIG: dict[str, bool] = {
     "zh_CN": True,
     "zh_TW": True,
-    "en_US": False,
+    "en_US": True,
     "ja_JP": False,
     "ko_KR": False,
     "es_ES": False,

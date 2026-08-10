@@ -8,8 +8,34 @@ from src.core.BaseEfTask import BaseEfTask
 from src.icons import Icons
 
 _LOCATIONS = {
-    "valley4": "四号谷地",
-    "wuling": "武陵",
+    "zh_CN": {
+        "valley4": "四号谷地",
+        "wuling": "武陵",
+    },
+    "zh_TW": {
+        "valley4": "四號谷地",
+        "wuling": "武陵",
+    },
+    "en_US": {
+        "valley4": "Valley IV",
+        "wuling": "Wuling",
+    },
+}
+
+# Detection patterns for current location (OCR text in the depot title)
+_LOCATION_DETECT = {
+    "zh_CN": {
+        "wuling": "武陵仓库",
+        "valley4": ("谷地", "仓库"),  # both substrings must appear
+    },
+    "zh_TW": {
+        "wuling": "武陵倉庫",
+        "valley4": ("谷地", "倉庫"),
+    },
+    "en_US": {
+        "wuling": "Wuling Depot",
+        "valley4": ("Valley", "Depot"),
+    },
 }
 
 
@@ -28,7 +54,7 @@ class WarehouseTransferTask(BaseEfTask):
         self.icon = Icons.ItemTransfer
         self.group_name = "仓储管理"
         self.group_icon = FluentIcon.FOLDER
-        self.description = "从发货仓库取出指定物品，切到收货仓库后一键存放 （目前只支持中文版）"
+        self.description = "从发货仓库取出指定物品，切到收货仓库后一键存放"
 
         self.default_config.update(
             {
@@ -48,8 +74,9 @@ class WarehouseTransferTask(BaseEfTask):
                 # "最小保留数量": "当识别到当前数量小于该值时停止任务并通知",
             }
         )
-        self.config_type["发货仓库"] = {"type": "drop_down", "options": list(_LOCATIONS.keys())}
-        self.config_type["收货仓库"] = {"type": "drop_down", "options": list(_LOCATIONS.keys())}
+        _location_keys = list(_LOCATIONS.get("zh_CN", {}).keys())
+        self.config_type["发货仓库"] = {"type": "drop_down", "options": _location_keys}
+        self.config_type["收货仓库"] = {"type": "drop_down", "options": _location_keys}
         # self.config_type["物品"] = {"type": "drop_down", "options": self._load_item_keys_for_dropdown()}
         self.config_type["物品"] = {
             "type": "drop_down",
@@ -69,49 +96,63 @@ class WarehouseTransferTask(BaseEfTask):
             self.click(result[0])
             self.wait_ui_stable(refresh_interval=0.2)
 
+    def _get_locale(self) -> str:
+        locale = self.runtime_locale
+        if locale and locale in _LOCATIONS:
+            return locale
+        return "zh_CN"
+
     def _detect_current_location(self) -> str | None:
-        boxes = self.ocr(box=self.box_of_screen(0.15, 0.18, 0.26, 0.22, name="current_location_area"))
+        boxes = self.ocr(box=self.box_of_screen(0.13, 0.18, 0.30, 0.22, name="current_location_area"))
+        locale = self._get_locale()
+        detect_map = _LOCATION_DETECT.get(locale, _LOCATION_DETECT["zh_CN"])
         for box in boxes or []:
             name = str(getattr(box, "name", "")).strip()
-            if "武陵仓库" in name:
-                return "wuling"
-            if "谷地" in name and "仓库" in name:
-                return "valley4"
+            for loc_key, pattern in detect_map.items():
+                if isinstance(pattern, tuple):
+                    if all(part in name for part in pattern):
+                        return loc_key
+                else:
+                    if pattern in name:
+                        return loc_key
         return None
 
     def _maybe_click_confirm(self) -> bool:
         hits = self.wait_ocr(
-            box=self.box_of_screen(0.79, 0.79, 0.84, 0.82, name="bottom_right"),
+            box=self.box_of_screen(0.79, 0.88, 0.95, 0.97, name="confirm_btn_area"),
             match=self.lang.WarehouseTransferTask.k_b56d9ac6,
-            time_out=1,
+            time_out=3,
             raise_if_not_found=False,
         )
         if hits:
             self.click(hits[0])
+            self.sleep(0.5)
             return True
         return False
 
     def _switch_location(self, target_key: str):
-        if target_key not in _LOCATIONS:
-            raise ValueError(f"未知 location key: {target_key}")
+        locale = self._get_locale()
+        loc_names = _LOCATIONS.get(locale, _LOCATIONS[“zh_CN”])
+        if target_key not in loc_names:
+            raise ValueError(f”未知 location key: {target_key}”)
 
         btn = self.wait_ocr(
-            box=self.box_of_screen(0.48, 0.18, 0.52, 0.215, name="switch_btn_area"),
+            box=self.box_of_screen(0.48, 0.18, 0.52, 0.215, name=”switch_btn_area”),
             match=self.lang.WarehouseTransferTask.k_3cb6baa6,
             time_out=5,
         )
         if not btn:
-            raise RuntimeError("未找到“仓库切换”按钮")
+            raise RuntimeError(“未找到”仓库切换”按钮”)
         self.click(btn[0])
 
-        target_text = _LOCATIONS[target_key]
+        target_text = loc_names[target_key]
         option = self.wait_ocr(
-            box=self.box_of_screen(0.4, 0.35, 0.75, 0.65, name="switch_menu"),
+            box=self.box_of_screen(0.4, 0.35, 0.75, 0.65, name=”switch_menu”),
             match=target_text,
             time_out=5,
         )
         if not option:
-            raise RuntimeError(f"未找到仓库选项：{target_text}")
+            raise RuntimeError(f”未找到仓库选项：{target_text}”)
         self.click(option[0])
 
         self._maybe_click_confirm()
@@ -122,11 +163,28 @@ class WarehouseTransferTask(BaseEfTask):
                 match=self.lang.WarehouseTransferTask.k_65fe35c4,
             )
             if hits:
-                self.send_key("esc")  # 确认使用send_key：esc为系统通用退出键，非游戏可配置热键
-                self.log_info(f"仓库切换成功")
+                self.sleep(1.0)
+                self._close_switch_depot_modal()
+                self.log_info(f”仓库切换成功”)
                 return
             self.sleep(0.5)
-        raise RuntimeError("切换仓库失败：5秒内未检测到“已连接”")
+        raise RuntimeError(“切换仓库失败：25秒内未检测到”已连接””)
+
+    def _close_switch_depot_modal(self):
+        “””Close the Switch Depot modal by clicking its X button.”””
+        # X button is at the top-right corner of the Switch Depot modal
+        close_box = self.box_of_screen(0.53, 0.05, 0.57, 0.09, name=”switch_depot_close”)
+        self.click(close_box)
+        self.sleep(0.5)
+        # Verify it closed by checking if the Switch Depot title is gone
+        title_hits = self.ocr(
+            box=self.box_of_screen(0.05, 0.05, 0.20, 0.10, name=”switch_depot_title”),
+            match=self.lang.WarehouseTransferTask.k_3cb6baa6,
+        )
+        if title_hits:
+            # Fallback: try ESC if X click didn't work
+            self.send_key(“esc”)
+            self.sleep(0.5)
 
     def _ctrl_click(self, box):
         win32api.keybd_event(
