@@ -145,31 +145,62 @@ class WarehouseTransferTask(BaseEfTask):
         return "zh_CN"
 
     def _detect_current_location(self) -> str | None:
-        boxes = self.ocr(box=self.box_of_screen(0.13, 0.18, 0.30, 0.22, name="current_location_area"))
+        detect_box = self.box_of_screen(0.10, 0.15, 0.35, 0.25, name="current_location_area")
+        boxes = self.ocr(box=detect_box)
         locale = self._get_locale()
         detect_map = _LOCATION_DETECT.get(locale, _LOCATION_DETECT["zh_CN"])
+
+        # Collect all OCR text for logging and combined matching
+        all_texts = []
+        for box in boxes or []:
+            text = str(getattr(box, "name", "")).strip()
+            if text:
+                all_texts.append(text)
+        combined_text = " ".join(all_texts)
+        self.log_info(f"[detect_location] locale={locale}, OCR texts={all_texts}, combined='{combined_text}'")
+
+        # First try per-box matching (exact single-box hit)
         for box in boxes or []:
             name = str(getattr(box, "name", "")).strip()
             for loc_key, pattern in detect_map.items():
                 if isinstance(pattern, tuple):
                     if all(part in name for part in pattern):
+                        self.log_info(f"[detect_location] matched '{loc_key}' via single box: '{name}'")
                         return loc_key
                 else:
                     if pattern in name:
+                        self.log_info(f"[detect_location] matched '{loc_key}' via single box: '{name}'")
                         return loc_key
+
+        # Fallback: check combined text (OCR may split title across multiple boxes)
+        for loc_key, pattern in detect_map.items():
+            if isinstance(pattern, tuple):
+                if all(part in combined_text for part in pattern):
+                    self.log_info(f"[detect_location] matched '{loc_key}' via combined text")
+                    return loc_key
+            else:
+                if pattern in combined_text:
+                    self.log_info(f"[detect_location] matched '{loc_key}' via combined text")
+                    return loc_key
+
+        self.log_info(f"[detect_location] NO MATCH found")
         return None
 
     def _maybe_click_confirm(self) -> bool:
+        confirm_text = self.lang.WarehouseTransferTask.k_b56d9ac6
+        self.log_info(f"[confirm] looking for '{confirm_text}' in bottom-right area")
         hits = self.wait_ocr(
             box=self.box_of_screen(0.79, 0.88, 0.95, 0.97, name="confirm_btn_area"),
-            match=self.lang.WarehouseTransferTask.k_b56d9ac6,
+            match=confirm_text,
             time_out=3,
             raise_if_not_found=False,
         )
         if hits:
+            self.log_info(f"[confirm] found, clicking")
             self.click(hits[0])
             self.sleep(0.5)
             return True
+        self.log_info(f"[confirm] not found (may not be needed)")
         return False
 
     def _switch_location(self, target_key: str):
@@ -178,55 +209,74 @@ class WarehouseTransferTask(BaseEfTask):
         if target_key not in loc_names:
             raise ValueError(f"未知 location key: {target_key}")
 
+        switch_text = self.lang.WarehouseTransferTask.k_3cb6baa6
+        self.log_info(f"[switch] looking for switch button '{switch_text}' locale={locale}")
         btn = self.wait_ocr(
-            box=self.box_of_screen(0.48, 0.18, 0.52, 0.215, name="switch_btn_area"),
-            match=self.lang.WarehouseTransferTask.k_3cb6baa6,
+            box=self.box_of_screen(0.40, 0.15, 0.60, 0.25, name="switch_btn_area"),
+            match=switch_text,
             time_out=5,
         )
         if not btn:
-            raise RuntimeError('未找到"仓库切换"按钮')
+            # Debug: scan wider area to see what OCR finds
+            wide_boxes = self.ocr(box=self.box_of_screen(0.30, 0.10, 0.70, 0.30, name="switch_btn_debug"))
+            debug_texts = [str(getattr(b, "name", "")) for b in (wide_boxes or [])]
+            self.log_info(f"[switch] button NOT found. Wide scan OCR: {debug_texts}")
+            raise RuntimeError(f'未找到"{switch_text}"按钮')
+        self.log_info(f"[switch] button found, clicking")
         self.click(btn[0])
 
         target_text = loc_names[target_key]
+        self.log_info(f"[switch] looking for menu option '{target_text}'")
         option = self.wait_ocr(
-            box=self.box_of_screen(0.4, 0.35, 0.75, 0.65, name="switch_menu"),
+            box=self.box_of_screen(0.3, 0.30, 0.75, 0.70, name="switch_menu"),
             match=target_text,
             time_out=5,
         )
         if not option:
+            # Debug: scan menu area
+            menu_boxes = self.ocr(box=self.box_of_screen(0.3, 0.30, 0.75, 0.70, name="switch_menu_debug"))
+            debug_texts = [str(getattr(b, "name", "")) for b in (menu_boxes or [])]
+            self.log_info(f"[switch] option NOT found. Menu OCR: {debug_texts}")
             raise RuntimeError(f"未找到仓库选项：{target_text}")
+        self.log_info(f"[switch] option found, clicking '{target_text}'")
         self.click(option[0])
 
         self._maybe_click_confirm()
-        for _ in range(50):
+        connected_text = self.lang.WarehouseTransferTask.k_65fe35c4
+        self.log_info(f"[switch] waiting for '{connected_text}' signal...")
+        for i in range(50):
             self.next_frame()
             hits = self.ocr(
                 box=self.box.bottom_right,
-                match=self.lang.WarehouseTransferTask.k_65fe35c4,
+                match=connected_text,
             )
             if hits:
+                self.log_info(f"[switch] '{connected_text}' detected after {i} polls")
                 self.sleep(1.0)
                 self._close_switch_depot_modal()
-                self.log_info(f"仓库切换成功")
+                self.log_info(f"[switch] depot switch complete")
                 return
             self.sleep(0.5)
-        raise RuntimeError('切换仓库失败：25秒内未检测到"已连接"')
+        raise RuntimeError(f'切换仓库失败：25秒内未检测到"{connected_text}"')
 
     def _close_switch_depot_modal(self):
         """Close the Switch Depot modal by clicking its X button."""
-        # X button is at the top-right corner of the Switch Depot modal
+        self.log_info("[close_modal] attempting to close Switch Depot modal via X button")
         close_box = self.box_of_screen(0.53, 0.05, 0.57, 0.09, name="switch_depot_close")
         self.click(close_box)
         self.sleep(0.5)
         # Verify it closed by checking if the Switch Depot title is gone
+        switch_text = self.lang.WarehouseTransferTask.k_3cb6baa6
         title_hits = self.ocr(
-            box=self.box_of_screen(0.05, 0.05, 0.20, 0.10, name="switch_depot_title"),
-            match=self.lang.WarehouseTransferTask.k_3cb6baa6,
+            box=self.box_of_screen(0.30, 0.10, 0.70, 0.25, name="switch_depot_title"),
+            match=switch_text,
         )
         if title_hits:
-            # Fallback: try ESC if X click didn't work
+            self.log_info("[close_modal] modal still open after X click, trying ESC")
             self.send_key("esc")
             self.sleep(0.5)
+        else:
+            self.log_info("[close_modal] modal closed successfully")
 
     def _ctrl_click(self, box):
         win32api.keybd_event(
@@ -252,6 +302,8 @@ class WarehouseTransferTask(BaseEfTask):
         if not item_key:
             raise RuntimeError("未选择物品")
         max_times = int(self.config.get("转移轮次", 10))
+        locale = self._get_locale()
+        self.log_info(f"[run] from={from_key}, to={to_key}, item={item_key}, rounds={max_times}, locale={locale}, resolution={self.width}x{self.height}")
         self.press_key("b")
         self.wait_until(
             lambda: self._detect_current_location() is not None,
