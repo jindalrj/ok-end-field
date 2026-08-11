@@ -349,6 +349,116 @@ class WarehouseTransferTask(BaseEfTask):
         self.click_relative(0.54, 0.06)
         self.sleep(0.5)
 
+    # Grid layout constants (relative to screen)
+    # From screenshot: grid spans ~(0.12, 0.28) to (0.55, 0.65), 8 cols × 4 visible rows
+    _GRID_LEFT = 0.125
+    _GRID_TOP = 0.29
+    _GRID_RIGHT = 0.545
+    _GRID_BOTTOM = 0.65
+    _GRID_COLS = 8
+    _GRID_ROWS = 4  # visible rows before scrolling
+
+    def _scan_grid_for_item(self, item_key_zh: str):
+        """
+        Scan the item grid by hovering each cell and reading the tooltip via OCR.
+
+        Moves left-to-right, top-to-bottom. After scanning all visible rows,
+        scrolls down and repeats. Stops when target is found or bottom-right
+        cell has been seen twice (indicating no more items to scroll).
+
+        Args:
+            item_key_zh: Chinese item name from config (used for matching)
+
+        Returns a Box-like object at the item center, or None.
+        """
+        from ok.feature.Box import Box
+
+        # Build match targets: Chinese name + English code name (spaces/underscores normalized)
+        targets = [item_key_zh.lower()]
+        en_code = ITEM_TRANSLATION_DICT.get(item_key_zh, "")
+        if en_code:
+            # "dense_source_ore_powder" -> match "dense" "source" "ore" "powder" as substrings
+            targets.append(en_code.replace("_", " ").lower())
+
+        w, h = self.width, self.height
+        col_width = (self._GRID_RIGHT - self._GRID_LEFT) / self._GRID_COLS
+        row_height = (self._GRID_BOTTOM - self._GRID_TOP) / self._GRID_ROWS
+
+        seen_items = set()
+        last_bottom_right_text = None
+        MAX_SCROLL_ROUNDS = 8
+
+        self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}, "
+                      f"cell_size=({col_width:.3f}, {row_height:.3f})")
+
+        for scroll_round in range(MAX_SCROLL_ROUNDS):
+            self.log_info(f"[grid_scan] --- scroll round {scroll_round} ---")
+            bottom_right_text = None
+
+            for row in range(self._GRID_ROWS):
+                for col in range(self._GRID_COLS):
+                    # Center of this grid cell (relative coords)
+                    cx_rel = self._GRID_LEFT + col_width * (col + 0.5)
+                    cy_rel = self._GRID_TOP + row_height * (row + 0.5)
+                    cx_px = int(cx_rel * w)
+                    cy_px = int(cy_rel * h)
+
+                    # Hover over the item
+                    self.move(cx_px, cy_px)
+                    self.sleep(0.25)
+
+                    # Capture frame and OCR the tooltip region
+                    # Tooltip appears near cursor - scan area above/around the hovered cell
+                    self.next_frame()
+                    frame = self.executor.frame
+                    if frame is None:
+                        continue
+
+                    # Tooltip box: slightly above and around the cursor position
+                    tooltip_y1 = max(0, int((cy_rel - row_height * 0.9) * h))
+                    tooltip_y2 = int(cy_rel * h)
+                    tooltip_x1 = max(0, int((cx_rel - col_width * 1.2) * w))
+                    tooltip_x2 = min(w, int((cx_rel + col_width * 1.2) * w))
+
+                    text = ocr_text(frame, box=(tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2), psm=6)
+                    text = text.strip()
+
+                    if text:
+                        self.log_info(f"[grid_scan] ({row},{col}) pos=({cx_rel:.3f},{cy_rel:.3f}) -> '{text}'")
+                        seen_items.add(text.lower())
+
+                        # Track bottom-right cell text for scroll termination
+                        if row == self._GRID_ROWS - 1 and col == self._GRID_COLS - 1:
+                            bottom_right_text = text
+
+                        # Check if this is our target (substring match)
+                        text_lower = text.lower()
+                        for target in targets:
+                            if target in text_lower or text_lower in target:
+                                self.log_info(f"[grid_scan] FOUND target '{target}' in '{text}' at ({row},{col})")
+                                return Box(cx_px - int(col_width * w / 2), cy_px - int(row_height * h / 2),
+                                           int(col_width * w), int(row_height * h), name=text)
+                    else:
+                        # Empty cell = no more items in this row
+                        self.log_info(f"[grid_scan] ({row},{col}) empty, skipping rest of row")
+                        break
+
+            # Check if we've hit the bottom (same content as last scroll)
+            if bottom_right_text and bottom_right_text == last_bottom_right_text:
+                self.log_info(f"[grid_scan] bottom-right unchanged ('{bottom_right_text}'), no more items")
+                break
+            last_bottom_right_text = bottom_right_text
+
+            # Scroll down to reveal more items
+            scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
+            scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
+            self.move(scroll_x, scroll_y)
+            self.scroll(scroll_x, scroll_y, -3)
+            self.sleep(0.6)
+
+        self.log_info(f"[grid_scan] targets {targets} NOT found. Seen: {sorted(seen_items)}")
+        return None
+
     def _ctrl_click(self, box):
         win32api.keybd_event(
             win32con.VK_CONTROL, 0, 0, 0
@@ -388,71 +498,22 @@ class WarehouseTransferTask(BaseEfTask):
             time_out=5,
             raise_if_not_found=False,
         )
-        search_box = self.box_of_screen(0.12, 0.30, 0.55, 0.68)
         while True:
             current = self._detect_current_location()
             if current != from_key:
                 self.log_info(f"当前仓库={current}，切换到发货仓库={from_key}")
                 self._switch_location(from_key)
             self._to_one_type_page(item_key)
-            cx = int(self.width / 3)
-            cy = int(self.height * 0.5)
             self.log_info(f"处理物品: {item_key}")
 
-            ROUND = 5
-            icon = None
-            item_template, item_mask = self._load_item_template(item_key)
-            item_key_en = ITEM_TRANSLATION_DICT.get(item_key, "")
-
-            # mask_function returns the pre-computed mask for alpha-based matching
-            _mask_fn = (lambda m: item_mask) if item_mask is not None else None
-
-            for round_idx in range(ROUND + 1):
-                if item_template is not None:
-                    # Direct template matching with alpha mask, no target_height resize
-                    icon = self.find_one(
-                        feature="item_template_match",
-                        template=item_template,
-                        box=search_box,
-                        threshold=0.7,
-                        mask_function=_mask_fn,
-                    )
-                elif item_key_en:
-                    # Fallback: use COCO feature if no template image available
-                    icon = self.find_one(feature=item_key_en, box=search_box, threshold=0.8)
-                else:
-                    raise RuntimeError(f"No template or feature found for item: {item_key}")
-                if icon:
-                    break
-                if round_idx == ROUND:
-                    break
-                self.move(cx, cy)
-                self.scroll(cx, cy, -2)
-                self.sleep(0.5)
+            # Find item by grid-scanning with hover + OCR
+            # Match against both Chinese name and English tooltip name
+            icon = self._scan_grid_for_item(item_key)
 
             if not icon:
-                raise RuntimeError(f"未找到物品图标（滚动{ROUND}轮后仍失败）：{item_key}")
+                raise RuntimeError(f"未找到物品图标（网格扫描后仍失败）：{item_key}")
             self._ctrl_click(icon)
             self.sleep(0.35)
-            if item_template is not None:
-                icon_after = self.find_feature(
-                    feature="item_template_match",
-                    template=item_template,
-                    box=search_box,
-                    threshold=0.7,
-                    mask_function=_mask_fn,
-                )
-            elif item_key_en:
-                icon_after = self.find_feature(feature=item_key_en, box=search_box, threshold=0.8)
-            else:
-                icon_after = None
-            if not icon_after:
-                self.log_info(f"物品图标已消失（可能已倒完）：{item_key}")
-                # count_after = self._read_count_near_icon(icon_after)
-                # if count_before is not None and count_after is not None:
-                #     self.log_debug(f"物品数量(后): {count_after}")
-                #     if count_after >= count_before:
-                #         raise RuntimeError(f"点击后数量未减少：{item_key} 前={count_before} 后={count_after}")
 
             self.log_info(f"切换到收货仓库={to_key}")
             self._switch_location(to_key)
