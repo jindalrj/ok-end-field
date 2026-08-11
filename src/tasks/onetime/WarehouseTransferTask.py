@@ -354,10 +354,10 @@ class WarehouseTransferTask(BaseEfTask):
     # Measured from 4K (3840x2160) runtime debug screenshots.
     # Row 0 at _GRID_TOP+0.5*row_height must land on the FIRST item row (y≈0.336),
     # NOT the category icons row above it (y≈0.238).
-    _GRID_LEFT = 0.085
-    _GRID_TOP = 0.288   # shifted down from 0.19 so row 0 = first item row
-    _GRID_RIGHT = 0.525
-    _GRID_BOTTOM = 0.678  # shifted down proportionally (4 rows × 0.0975 below TOP)
+    _GRID_LEFT = 0.140   # shifted right from 0.085 (old col 0 was left of first item)
+    _GRID_TOP = 0.288    # shifted down from 0.19 so row 0 = first item row
+    _GRID_RIGHT = 0.580  # 0.140 + 8 * 0.055
+    _GRID_BOTTOM = 0.678 # shifted down proportionally (4 rows × 0.0975 below TOP)
     _GRID_COLS = 8
     _GRID_ROWS = 4  # visible rows before scrolling
 
