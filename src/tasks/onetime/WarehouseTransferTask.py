@@ -351,12 +351,13 @@ class WarehouseTransferTask(BaseEfTask):
         self.sleep(0.5)
 
     # Grid layout constants (relative to full game frame)
-    # Measured from runtime screenshots: items start at ~(0.065, 0.15)
-    # Grid is 8 columns wide, 4 visible rows before needing to scroll
-    _GRID_LEFT = 0.065
-    _GRID_TOP = 0.155
-    _GRID_RIGHT = 0.535
-    _GRID_BOTTOM = 0.62
+    # Measured from 4K (3840x2160) runtime debug screenshots:
+    # First item top-left corner: ~(0.085, 0.19)
+    # Last col right edge: ~0.525, 4th row bottom: ~0.58
+    _GRID_LEFT = 0.085
+    _GRID_TOP = 0.19
+    _GRID_RIGHT = 0.525
+    _GRID_BOTTOM = 0.58
     _GRID_COLS = 8
     _GRID_ROWS = 4  # visible rows before scrolling
 
@@ -445,8 +446,8 @@ class WarehouseTransferTask(BaseEfTask):
                     tooltip_x1 = max(0, int((cx_rel - col_width * 1.5) * w))
                     tooltip_x2 = min(w, int((cx_rel + col_width * 1.5) * w))
 
-                    # Save debug screenshots for first 8 cells (one full row)
-                    if scroll_round == 0 and row == 0:
+                    # Save debug screenshots (first 2 scroll rounds, all cells)
+                    if scroll_round <= 1:
                         try:
                             debug_frame = frame.copy()
                             cv2.rectangle(debug_frame, (tooltip_x1, tooltip_y1), (tooltip_x2, tooltip_y2), (0, 255, 0), 2)
@@ -495,9 +496,10 @@ class WarehouseTransferTask(BaseEfTask):
             # Scroll down to reveal more items
             scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
             scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
-            self.move(scroll_x, scroll_y)
-            self.scroll(scroll_x, scroll_y, -3)
-            self.sleep(0.6)
+            self._hover_absolute(scroll_x, scroll_y)
+            self.sleep(0.1)
+            self.scroll(scroll_x, scroll_y, -2)
+            self.sleep(0.8)
 
         self.log_info(f"[grid_scan] targets {targets} NOT found. Seen: {sorted(seen_items)}")
         return None
