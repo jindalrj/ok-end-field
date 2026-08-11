@@ -132,11 +132,20 @@ jobs:
         run: |
           $cargoDir = Join-Path $env:USERPROFILE ".cargo"
           $pnpmStore = Join-Path $env:LOCALAPPDATA "pnpm" "store"
+          $exePath = Join-Path $env:RUNNER_TEMP "p" "src-tauri" "target" "release"
           New-Item -ItemType Directory -Force -Path (Join-Path $cargoDir "registry") | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $cargoDir "git") | Out-Null
           New-Item -ItemType Directory -Force -Path $pnpmStore | Out-Null
+          New-Item -ItemType Directory -Force -Path $exePath | Out-Null
           "cargo-dir=$cargoDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "pnpm-store=$pnpmStore" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "exe-path=$exePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Cache Tauri exe (skips Rust build on hit)
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.cache-paths.outputs.exe-path }}/ok-ef.exe
+          key: tauri-exe-${{ runner.os }}-pyappify-v1.1.9
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -157,6 +166,8 @@ jobs:
       - name: Build with PyAppify Action
         id: build-app
         uses: jindalrj/pyappify-action@master
+        with:
+          version: v1.1.9
 
       - name: Add version to build filenames
         shell: pwsh
