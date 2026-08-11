@@ -113,21 +113,38 @@ class WarehouseTransferTask(BaseEfTask):
         self._item_name_cache: dict[str, str] | None = None
 
     def _load_item_template(self, item_name: str):
-        """Load the template image for an item, returning a cv2 ndarray or None."""
+        """Load the template image (BGR) and alpha mask for an item.
+
+        Returns (template_bgr, mask) tuple or (None, None).
+        The alpha channel from RGBA templates is used as the match mask,
+        which is critical for correct template matching (without mask,
+        confidence drops from 0.83+ to 0.53 due to transparent background).
+        """
         if item_name in self._template_cache:
             return self._template_cache[item_name]
         template_map = _load_item_template_map()
         template_filename = template_map.get(item_name)
         if not template_filename:
-            self._template_cache[item_name] = None
-            return None
+            self._template_cache[item_name] = (None, None)
+            return (None, None)
         template_path = _ITEM_TEMPLATE_DIR / f"{template_filename}.png"
         if not template_path.exists():
-            self._template_cache[item_name] = None
-            return None
-        img = cv2.imread(str(template_path), cv2.IMREAD_COLOR)
-        self._template_cache[item_name] = img
-        return img
+            self._template_cache[item_name] = (None, None)
+            return (None, None)
+        img = cv2.imread(str(template_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            self._template_cache[item_name] = (None, None)
+            return (None, None)
+        if img.shape[2] == 4:
+            alpha = img[:, :, 3]
+            bgr = img[:, :, :3]
+            # Create 3-channel mask from alpha for cv2.matchTemplate
+            mask = cv2.merge([alpha, alpha, alpha])
+        else:
+            bgr = img
+            mask = None
+        self._template_cache[item_name] = (bgr, mask)
+        return (bgr, mask)
 
     def _to_one_type_page(self, item_name: str):
         category_en_name = ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH.get(item_to_warehouse_dict.get(item_name, ""), "")
@@ -384,18 +401,21 @@ class WarehouseTransferTask(BaseEfTask):
 
             ROUND = 5
             icon = None
-            item_template = self._load_item_template(item_key)
+            item_template, item_mask = self._load_item_template(item_key)
             item_key_en = ITEM_TRANSLATION_DICT.get(item_key, "")
+
+            # mask_function returns the pre-computed mask for alpha-based matching
+            _mask_fn = (lambda m: item_mask) if item_mask is not None else None
 
             for round_idx in range(ROUND + 1):
                 if item_template is not None:
-                    # Use direct template matching (resolution-independent via target_height)
+                    # Direct template matching with alpha mask, no target_height resize
                     icon = self.find_one(
                         feature="item_template_match",
                         template=item_template,
                         box=search_box,
                         threshold=0.7,
-                        target_height=180,
+                        mask_function=_mask_fn,
                     )
                 elif item_key_en:
                     # Fallback: use COCO feature if no template image available
@@ -420,7 +440,7 @@ class WarehouseTransferTask(BaseEfTask):
                     template=item_template,
                     box=search_box,
                     threshold=0.7,
-                    target_height=180,
+                    mask_function=_mask_fn,
                 )
             elif item_key_en:
                 icon_after = self.find_feature(feature=item_key_en, box=search_box, threshold=0.8)
