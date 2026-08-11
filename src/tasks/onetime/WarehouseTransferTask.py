@@ -358,6 +358,16 @@ class WarehouseTransferTask(BaseEfTask):
     _GRID_COLS = 8
     _GRID_ROWS = 4  # visible rows before scrolling
 
+    def _hover_absolute(self, px_x: int, px_y: int):
+        """Move the real cursor to absolute screen position over the game window.
+
+        Unlike self.move() which only sends WM_MOUSEMOVE via PostMessage,
+        this uses SetCursorPos to physically move the cursor — required for
+        the game to show item tooltips on hover.
+        """
+        abs_x, abs_y = self.executor.interaction.capture.get_abs_cords(px_x, px_y)
+        win32api.SetCursorPos((abs_x, abs_y))
+
     def _scan_grid_for_item(self, item_key_zh: str):
         """
         Scan the item grid by hovering each cell and reading the tooltip via OCR.
@@ -403,22 +413,21 @@ class WarehouseTransferTask(BaseEfTask):
                     cx_px = int(cx_rel * w)
                     cy_px = int(cy_rel * h)
 
-                    # Hover over the item
-                    self.move(cx_px, cy_px)
-                    self.sleep(0.25)
+                    # Hover using real cursor (required for tooltip to appear)
+                    self._hover_absolute(cx_px, cy_px)
+                    self.sleep(0.55)  # tooltip takes ~0.5s to appear
 
                     # Capture frame and OCR the tooltip region
-                    # Tooltip appears near cursor - scan area above/around the hovered cell
                     self.next_frame()
                     frame = self.executor.frame
                     if frame is None:
                         continue
 
-                    # Tooltip box: slightly above and around the cursor position
-                    tooltip_y1 = max(0, int((cy_rel - row_height * 0.9) * h))
-                    tooltip_y2 = int(cy_rel * h)
-                    tooltip_x1 = max(0, int((cx_rel - col_width * 1.2) * w))
-                    tooltip_x2 = min(w, int((cx_rel + col_width * 1.2) * w))
+                    # Tooltip box: above the cursor, spanning ~2x cell width
+                    tooltip_y1 = max(0, int((cy_rel - row_height * 1.0) * h))
+                    tooltip_y2 = int((cy_rel - 0.01) * h)
+                    tooltip_x1 = max(0, int((cx_rel - col_width * 1.5) * w))
+                    tooltip_x2 = min(w, int((cx_rel + col_width * 1.5) * w))
 
                     text = ocr_text(frame, box=(tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2), psm=6)
                     text = text.strip()
