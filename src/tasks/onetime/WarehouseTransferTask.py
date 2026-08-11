@@ -430,14 +430,16 @@ class WarehouseTransferTask(BaseEfTask):
                         self.log_info(f"[grid_scan] ({row},{col}) frame is None!")
                         continue
 
-                    # Tooltip box: above the cursor, spanning ~2x cell width
-                    tooltip_y1 = max(0, int((cy_rel - row_height * 1.0) * h))
-                    tooltip_y2 = int((cy_rel - 0.01) * h)
+                    # Tooltip region: the tooltip appears as a small card overlapping
+                    # the top portion of the hovered item. Scan from above the cell
+                    # center down to just below it, wide enough to catch offset tooltips.
+                    tooltip_y1 = max(0, int((cy_rel - row_height * 0.7) * h))
+                    tooltip_y2 = int((cy_rel + row_height * 0.1) * h)
                     tooltip_x1 = max(0, int((cx_rel - col_width * 1.5) * w))
                     tooltip_x2 = min(w, int((cx_rel + col_width * 1.5) * w))
 
-                    # Save debug screenshot with tooltip region drawn
-                    if scroll_round == 0 and row < 2:
+                    # Save debug screenshots for first 8 cells (one full row)
+                    if scroll_round == 0 and row == 0:
                         try:
                             debug_frame = frame.copy()
                             cv2.rectangle(debug_frame, (tooltip_x1, tooltip_y1), (tooltip_x2, tooltip_y2), (0, 255, 0), 2)
@@ -475,9 +477,7 @@ class WarehouseTransferTask(BaseEfTask):
                                 return Box(cx_px - int(col_width * w / 2), cy_px - int(row_height * h / 2),
                                            int(col_width * w), int(row_height * h), name=text)
                     else:
-                        # Empty cell = no more items in this row
-                        self.log_info(f"[grid_scan] ({row},{col}) empty, skipping rest of row")
-                        break
+                        self.log_info(f"[grid_scan] ({row},{col}) empty")
 
             # Check if we've hit the bottom (same content as last scroll)
             if bottom_right_text and bottom_right_text == last_bottom_right_text:

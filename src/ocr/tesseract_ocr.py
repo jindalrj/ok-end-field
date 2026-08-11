@@ -21,9 +21,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Bundled Tesseract location (relative to the working directory)
-_BUNDLED_DIR = Path(__file__).resolve().parents[2] / "tesseract"
-_BUNDLED_EXE = _BUNDLED_DIR / "tesseract.exe"
+# Bundled Tesseract locations (checked in order)
+# 1. Inside repo root (2 levels up from src/ocr/tesseract_ocr.py)
+_BUNDLED_DIR_REPO = Path(__file__).resolve().parents[2] / "tesseract"
+# 2. App-level directory (3 levels up, outside git checkout - survives git fetch/clean)
+_BUNDLED_DIR_APP = Path(__file__).resolve().parents[3] / "tesseract"
+_BUNDLED_DIRS = [_BUNDLED_DIR_REPO, _BUNDLED_DIR_APP]
 
 # Fallback cache directory for Tesseract (auto-download location)
 _CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "tesseract"
@@ -35,8 +38,10 @@ _initialized = False
 def _find_tesseract() -> str | None:
     """Find tesseract.exe - check bundled, cache, PATH, and common locations."""
     # 1. Check bundled with app (placed by build workflow)
-    if _BUNDLED_EXE.exists():
-        return str(_BUNDLED_EXE)
+    for bundled_dir in _BUNDLED_DIRS:
+        exe = bundled_dir / "tesseract.exe"
+        if exe.exists():
+            return str(exe)
 
     # 2. Check download cache
     if _TESSERACT_EXE.exists():
