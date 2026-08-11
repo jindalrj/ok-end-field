@@ -350,24 +350,31 @@ class WarehouseTransferTask(BaseEfTask):
         self.click_relative(0.54, 0.06)
         self.sleep(0.5)
 
-    # Grid layout constants (relative to screen)
-    # From screenshot: grid spans ~(0.12, 0.28) to (0.55, 0.65), 8 cols × 4 visible rows
-    _GRID_LEFT = 0.125
-    _GRID_TOP = 0.29
-    _GRID_RIGHT = 0.545
-    _GRID_BOTTOM = 0.65
+    # Grid layout constants (relative to full game frame)
+    # Measured from runtime screenshots: items start at ~(0.065, 0.15)
+    # Grid is 8 columns wide, 4 visible rows before needing to scroll
+    _GRID_LEFT = 0.065
+    _GRID_TOP = 0.155
+    _GRID_RIGHT = 0.535
+    _GRID_BOTTOM = 0.62
     _GRID_COLS = 8
     _GRID_ROWS = 4  # visible rows before scrolling
 
     def _hover_absolute(self, px_x: int, px_y: int):
-        """Move the real cursor to absolute screen position over the game window.
+        """Move the real cursor AND send WM_MOUSEMOVE to trigger game tooltip.
 
-        Unlike self.move() which only sends WM_MOUSEMOVE via PostMessage,
-        this uses SetCursorPos to physically move the cursor — required for
-        the game to show item tooltips on hover.
+        Uses SetCursorPos for physical cursor + PostMessage WM_MOUSEMOVE
+        so the game processes the hover event (needed for tooltip popup).
         """
-        abs_x, abs_y = self.executor.interaction.capture.get_abs_cords(px_x, px_y)
+        import win32gui
+        # Activate window and move real cursor
+        interaction = self.executor.interaction
+        interaction.try_activate()
+        abs_x, abs_y = interaction.capture.get_abs_cords(px_x, px_y)
         win32api.SetCursorPos((abs_x, abs_y))
+        # Also send WM_MOUSEMOVE to the game window so it processes the hover
+        lParam = win32api.MAKELONG(px_x, px_y)
+        win32gui.PostMessage(interaction.hwnd, win32con.WM_MOUSEMOVE, 0, lParam)
 
     def _scan_grid_for_item(self, item_key_zh: str):
         """
