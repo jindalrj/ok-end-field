@@ -35,8 +35,7 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
           lfs: true
-          fetch-depth: 0
-          fetch-tags: true
+          fetch-depth: 1
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -96,8 +95,7 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
           lfs: true
-          fetch-depth: 0
-          fetch-tags: true
+          fetch-depth: 1
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -122,9 +120,80 @@ jobs:
         run: |
           python -m ok.update.inline_ok_requirements --tag ${{ steps.tag.outputs.tag }}
 
-      - name: Build with PyAppify Action
+      - name: Build PyAppify exe only
         id: build-app
         uses: ok-oldking/pyappify-action@master
+        with:
+          build_exe_only: true
+
+      - name: Package installer (strip .git to reduce size)
+        shell: pwsh
+        run: |
+          $exePath = "${{ steps.build-app.outputs.exe-path }}"
+          $exeFolder = "${{ steps.build-app.outputs.exe-folder }}"
+          # buildDir is 3 levels up from exe: <buildDir>/src-tauri/target/release/ok-ef.exe
+          $buildDir = (Get-Item $exeFolder).Parent.Parent.Parent.FullName
+          $tauriDataPath = Join-Path $buildDir "src-tauri\data"
+          $distDir = "pyappify_dist"
+          $appDistDir = Join-Path $distDir "ok-ef"
+
+          Write-Host "exePath: $exePath"
+          Write-Host "buildDir: $buildDir"
+          Write-Host "tauriDataPath: $tauriDataPath"
+
+          # Copy exe to dist
+          New-Item -ItemType Directory -Force -Path $appDistDir | Out-Null
+          $exeDestPath = Join-Path $appDistDir "ok-ef.exe"
+          Copy-Item $exePath $exeDestPath
+
+          # Create online installer (empty data)
+          if (Test-Path $tauriDataPath) { Remove-Item -Recurse -Force $tauriDataPath }
+          New-Item -ItemType Directory -Force -Path $tauriDataPath | Out-Null
+          Push-Location $buildDir
+          pnpm tauri bundle
+          Pop-Location
+          $nsisDir = Join-Path $buildDir "src-tauri\target\release\bundle\nsis"
+          $onlineInstaller = Get-ChildItem $nsisDir -Filter "*.exe" | Select-Object -First 1
+          if ($onlineInstaller) {
+            Move-Item $onlineInstaller.FullName (Join-Path $distDir "ok-ef-win32-online-setup.exe")
+          }
+
+          # Run setup for Global profile
+          & $exeDestPath -c setup -p Global
+          $dataPath = Join-Path $appDistDir "data"
+
+          # Remove .git to save ~500MB in final installer
+          if (Test-Path $dataPath) {
+            Get-ChildItem -Path $dataPath -Directory -Recurse -Filter ".git" | ForEach-Object {
+              $size = (Get-ChildItem $_.FullName -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
+              Write-Host "Removing $($_.FullName) ($([math]::Round($size, 1)) MB)"
+              Remove-Item -Recurse -Force $_.FullName
+            }
+            # Also remove test images and model training assets that aren't needed at runtime
+            @("x-anylabeling-asset", "tests\images") | ForEach-Object {
+              $p = Join-Path $dataPath "apps\ok-ef\working\$_"
+              if (Test-Path $p) {
+                Write-Host "Removing $p"
+                Remove-Item -Recurse -Force $p
+              }
+            }
+          }
+
+          # Move cleaned data to tauri and bundle
+          if (Test-Path $tauriDataPath) { Remove-Item -Recurse -Force $tauriDataPath }
+          Move-Item $dataPath $tauriDataPath
+
+          Push-Location $buildDir
+          pnpm tauri bundle
+          Pop-Location
+
+          $installer = Get-ChildItem $nsisDir -Filter "*.exe" | Select-Object -First 1
+          if ($installer) {
+            Move-Item $installer.FullName (Join-Path $distDir "ok-ef-win32-Global-setup.exe")
+          }
+
+          # Cleanup data from dist (keep only exe + installers)
+          Get-ChildItem $appDistDir | Where-Object { $_.Name -ne "ok-ef.exe" } | Remove-Item -Recurse -Force
 
       - name: Add version to build filenames
         shell: pwsh
