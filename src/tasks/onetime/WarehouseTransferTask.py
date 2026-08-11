@@ -351,13 +351,13 @@ class WarehouseTransferTask(BaseEfTask):
         self.sleep(0.5)
 
     # Grid layout constants (relative to full game frame)
-    # Measured from 4K (3840x2160) runtime debug screenshots:
-    # First item top-left corner: ~(0.085, 0.19)
-    # Last col right edge: ~0.525, 4th row bottom: ~0.58
+    # Measured from 4K (3840x2160) runtime debug screenshots.
+    # Row 0 at _GRID_TOP+0.5*row_height must land on the FIRST item row (y≈0.336),
+    # NOT the category icons row above it (y≈0.238).
     _GRID_LEFT = 0.085
-    _GRID_TOP = 0.19
+    _GRID_TOP = 0.288   # shifted down from 0.19 so row 0 = first item row
     _GRID_RIGHT = 0.525
-    _GRID_BOTTOM = 0.58
+    _GRID_BOTTOM = 0.678  # shifted down proportionally (4 rows × 0.0975 below TOP)
     _GRID_COLS = 8
     _GRID_ROWS = 4  # visible rows before scrolling
 
@@ -436,10 +436,13 @@ class WarehouseTransferTask(BaseEfTask):
                     if frame is None:
                         continue
 
-                    tooltip_y1 = max(0, int((cy_rel - row_height * 0.7) * h))
-                    tooltip_y2 = int((cy_rel + row_height * 0.1) * h)
-                    tooltip_x1 = max(0, int((cx_rel - col_width * 1.5) * w))
-                    tooltip_x2 = min(w, int((cx_rel + col_width * 1.5) * w))
+                    # Tooltip appears BELOW and to the RIGHT of the cursor.
+                    # Measured: text starts ~20px below cursor, extends ~110px down,
+                    # starts ~50px right of cursor, extends ~450px right.
+                    tooltip_x1 = min(w, int(cx_px + 50))
+                    tooltip_x2 = min(w, int(cx_px + 450))
+                    tooltip_y1 = max(0, int(cy_px + 20))
+                    tooltip_y2 = min(h, int(cy_px + 110))
 
                     row_captures.append((col, cx_px, cy_px, frame.copy(),
                                          (tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2)))
@@ -489,13 +492,16 @@ class WarehouseTransferTask(BaseEfTask):
                 break
             last_bottom_right_text = bottom_right_text
 
-            # Scroll down to reveal more items
+            # Scroll down to reveal more items (scroll ~3 rows worth)
             scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
             scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
             self._hover_absolute(scroll_x, scroll_y)
-            self.sleep(0.15)
-            self.scroll(scroll_x, scroll_y, -2)
-            self.sleep(0.8)
+            self.sleep(0.2)
+            self.scroll(scroll_x, scroll_y, -3)
+            self.sleep(1.2)
+            # Discard stale frame so next_frame() returns fresh content
+            self.next_frame()
+            self.sleep(0.3)
 
         self.log_info(f"[grid_scan] targets {targets} NOT found. Seen: {sorted(seen_items)}")
         return None
