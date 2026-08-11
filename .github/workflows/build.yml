@@ -120,26 +120,42 @@ jobs:
         run: |
           python -m ok.update.inline_ok_requirements --tag ${{ steps.tag.outputs.tag }}
 
+      - name: Prepare cache paths
+        id: cache-paths
+        shell: pwsh
+        run: |
+          $cargoDir = Join-Path $env:USERPROFILE ".cargo"
+          $pnpmStore = Join-Path $env:LOCALAPPDATA "pnpm" "store"
+          $cargoTarget = Join-Path $env:RUNNER_TEMP "p" "src-tauri" "target"
+          # Ensure directories exist so cache save doesn't fail
+          New-Item -ItemType Directory -Force -Path (Join-Path $cargoDir "registry") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $cargoDir "git") | Out-Null
+          New-Item -ItemType Directory -Force -Path $pnpmStore | Out-Null
+          New-Item -ItemType Directory -Force -Path $cargoTarget | Out-Null
+          "cargo-dir=$cargoDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "pnpm-store=$pnpmStore" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "cargo-target=$cargoTarget" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry/
-            ~/.cargo/git/
+            ${{ steps.cache-paths.outputs.cargo-dir }}/registry
+            ${{ steps.cache-paths.outputs.cargo-dir }}/git
           key: cargo-registry-${{ runner.os }}-pyappify
           restore-keys: cargo-registry-${{ runner.os }}-
 
       - name: Cache Cargo build target
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/p/src-tauri/target
+          path: ${{ steps.cache-paths.outputs.cargo-target }}
           key: cargo-target-${{ runner.os }}-pyappify
           restore-keys: cargo-target-${{ runner.os }}-
 
       - name: Cache pnpm store
         uses: actions/cache@v4
         with:
-          path: ~/AppData/Local/pnpm/store
+          path: ${{ steps.cache-paths.outputs.pnpm-store }}
           key: pnpm-store-${{ runner.os }}-pyappify
           restore-keys: pnpm-store-${{ runner.os }}-
 
