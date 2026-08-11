@@ -420,68 +420,64 @@ class WarehouseTransferTask(BaseEfTask):
             bottom_right_text = None
 
             for row in range(self._GRID_ROWS):
+                # Phase 1: Hover each cell and capture frames (no OCR yet, smooth movement)
+                row_captures = []  # list of (col, cx_px, cy_px, frame, tooltip_box)
                 for col in range(self._GRID_COLS):
-                    # Center of this grid cell (relative coords)
                     cx_rel = self._GRID_LEFT + col_width * (col + 0.5)
                     cy_rel = self._GRID_TOP + row_height * (row + 0.5)
                     cx_px = int(cx_rel * w)
                     cy_px = int(cy_rel * h)
 
-                    # Hover using real cursor (required for tooltip to appear)
                     self._hover_absolute(cx_px, cy_px)
-                    self.sleep(0.6)  # tooltip takes ~0.5s to appear
+                    self.sleep(0.65)  # wait for tooltip to appear
 
-                    # Capture frame and OCR the tooltip region
                     self.next_frame()
                     frame = self.executor.frame
                     if frame is None:
-                        self.log_info(f"[grid_scan] ({row},{col}) frame is None!")
                         continue
 
-                    # Tooltip region: the tooltip appears as a small card overlapping
-                    # the top portion of the hovered item. Scan from above the cell
-                    # center down to just below it, wide enough to catch offset tooltips.
                     tooltip_y1 = max(0, int((cy_rel - row_height * 0.7) * h))
                     tooltip_y2 = int((cy_rel + row_height * 0.1) * h)
                     tooltip_x1 = max(0, int((cx_rel - col_width * 1.5) * w))
                     tooltip_x2 = min(w, int((cx_rel + col_width * 1.5) * w))
 
-                    # Save debug screenshots (first 2 scroll rounds, all cells)
+                    row_captures.append((col, cx_px, cy_px, frame.copy(),
+                                         (tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2)))
+
+                # Phase 2: OCR all captured frames (blocking calls happen here, cursor idle)
+                for col, cx_px, cy_px, frame, (tx1, ty1, tx2, ty2) in row_captures:
+                    # Save debug screenshots
                     if scroll_round <= 1:
                         try:
                             debug_frame = frame.copy()
-                            cv2.rectangle(debug_frame, (tooltip_x1, tooltip_y1), (tooltip_x2, tooltip_y2), (0, 255, 0), 2)
-                            cv2.circle(debug_frame, (cx_px, cy_px), 10, (0, 0, 255), -1)
+                            cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (0, 255, 0), 3)
+                            cv2.circle(debug_frame, (cx_px, cy_px), 12, (0, 0, 255), -1)
                             cv2.imwrite(str(debug_dir / f"r{scroll_round}_cell_{row}_{col}.png"), debug_frame)
-                            # Also save just the tooltip crop
-                            crop = frame[tooltip_y1:tooltip_y2, tooltip_x1:tooltip_x2]
+                            crop = frame[ty1:ty2, tx1:tx2]
                             if crop.size > 0:
                                 cv2.imwrite(str(debug_dir / f"r{scroll_round}_tooltip_{row}_{col}.png"), crop)
                         except Exception as e:
                             self.log_info(f"[grid_scan] screenshot save failed: {e}")
 
-                    text = ocr_text(frame, box=(tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2), psm=6)
+                    text = ocr_text(frame, box=(tx1, ty1, tx2, ty2), psm=6)
                     text = text.strip()
+
                     if not text and row == 0 and col == 0 and scroll_round == 0:
-                        # First cell empty = likely Tesseract not initialized
                         from src.ocr.tesseract_ocr import _initialized
                         self.log_info(f"[grid_scan] first cell empty! tesseract _initialized={_initialized}, "
-                                      f"tooltip_box=({tooltip_x1},{tooltip_y1},{tooltip_x2},{tooltip_y2}), "
-                                      f"frame_shape={frame.shape}")
+                                      f"tooltip_box=({tx1},{ty1},{tx2},{ty2}), frame_shape={frame.shape}")
 
                     if text:
-                        self.log_info(f"[grid_scan] ({row},{col}) pos=({cx_rel:.3f},{cy_rel:.3f}) -> '{text}'")
+                        self.log_info(f"[grid_scan] ({row},{col}) -> '{text}'")
                         seen_items.add(text.lower())
 
-                        # Track bottom-right cell text for scroll termination
                         if row == self._GRID_ROWS - 1 and col == self._GRID_COLS - 1:
                             bottom_right_text = text
 
-                        # Check if this is our target (substring match)
                         text_lower = text.lower()
                         for target in targets:
                             if target in text_lower or text_lower in target:
-                                self.log_info(f"[grid_scan] FOUND target '{target}' in '{text}' at ({row},{col})")
+                                self.log_info(f"[grid_scan] FOUND '{target}' in '{text}' at ({row},{col})")
                                 return Box(cx_px - int(col_width * w / 2), cy_px - int(row_height * h / 2),
                                            int(col_width * w), int(row_height * h), name=text)
                     else:
@@ -497,7 +493,7 @@ class WarehouseTransferTask(BaseEfTask):
             scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
             scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
             self._hover_absolute(scroll_x, scroll_y)
-            self.sleep(0.1)
+            self.sleep(0.15)
             self.scroll(scroll_x, scroll_y, -2)
             self.sleep(0.8)
 
