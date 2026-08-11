@@ -120,6 +120,29 @@ jobs:
         run: |
           python -m ok.update.inline_ok_requirements --tag ${{ steps.tag.outputs.tag }}
 
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+          key: cargo-registry-${{ runner.os }}-pyappify
+          restore-keys: cargo-registry-${{ runner.os }}-
+
+      - name: Cache Cargo build target
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/p/src-tauri/target
+          key: cargo-target-${{ runner.os }}-pyappify
+          restore-keys: cargo-target-${{ runner.os }}-
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/pnpm/store
+          key: pnpm-store-${{ runner.os }}-pyappify
+          restore-keys: pnpm-store-${{ runner.os }}-
+
       - name: Build with PyAppify Action
         id: build-app
         uses: jindalrj/pyappify-action@master
