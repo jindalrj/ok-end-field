@@ -139,8 +139,21 @@ def ensure_tesseract():
     tessdata = Path(tesseract_path).parent / "tessdata"
     if tessdata.exists():
         os.environ["TESSDATA_PREFIX"] = str(tessdata.parent)
+    else:
+        logger.warning(f"tessdata not found at {tessdata} - OCR may fail!")
 
-    logger.info(f"Tesseract configured: {tesseract_path}")
+    # Verify tesseract actually works
+    try:
+        version = subprocess.run(
+            [tesseract_path, "--version"],
+            capture_output=True, text=True, timeout=5
+        )
+        logger.info(f"Tesseract configured: {tesseract_path} "
+                    f"(version: {version.stdout.splitlines()[0] if version.stdout else 'unknown'})")
+    except Exception as e:
+        logger.warning(f"Tesseract version check failed: {e}")
+        logger.info(f"Tesseract configured: {tesseract_path}")
+
     _initialized = True
 
 
@@ -207,6 +220,10 @@ def ocr_frame(frame: np.ndarray, box=None, psm: int = 6) -> list[dict]:
         return []
 
 
+_ocr_call_count = 0
+_ocr_fail_logged = False
+
+
 def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
     """
     Run Tesseract OCR and return combined text string.
@@ -219,7 +236,12 @@ def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
     Returns:
         Combined text string from all detections, or "" on any error
     """
+    global _ocr_call_count, _ocr_fail_logged
+
     if not _initialized:
+        if not _ocr_fail_logged:
+            logger.warning("ocr_text called but tesseract not initialized!")
+            _ocr_fail_logged = True
         return ""
 
     try:
@@ -245,9 +267,17 @@ def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
         if img_np.size == 0:
             return ""
 
-        return pytesseract.image_to_string(img_np, config=f'--psm {psm}').strip()
+        _ocr_call_count += 1
+        result = pytesseract.image_to_string(img_np, config=f'--psm {psm}').strip()
+
+        # Log first few calls for diagnostics
+        if _ocr_call_count <= 3:
+            logger.info(f"ocr_text call #{_ocr_call_count}: box={box}, "
+                        f"crop_size={img_np.shape}, result='{result[:60]}'")
+
+        return result
     except Exception as e:
-        logger.debug(f"Tesseract ocr_text failed: {e}")
+        logger.warning(f"Tesseract ocr_text FAILED: {e}")
         return ""
 
 

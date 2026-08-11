@@ -350,14 +350,15 @@ class WarehouseTransferTask(BaseEfTask):
         self.click_relative(0.54, 0.06)
         self.sleep(0.5)
 
-    # Grid layout constants (relative to full game frame)
-    # Measured from 4K (3840x2160) runtime debug screenshots.
-    # Row 0 at _GRID_TOP+0.5*row_height must land on the FIRST item row (y≈0.336),
-    # NOT the category icons row above it (y≈0.238).
-    _GRID_LEFT = 0.140   # shifted right from 0.085 (old col 0 was left of first item)
-    _GRID_TOP = 0.288    # shifted down from 0.19 so row 0 = first item row
-    _GRID_RIGHT = 0.580  # 0.140 + 8 * 0.055
-    _GRID_BOTTOM = 0.678 # shifted down proportionally (4 rows × 0.0975 below TOP)
+    # Grid layout constants (relative to full 3840x2160 game frame).
+    # Measured via OpenCV contour detection on item slot borders:
+    # - Item slots are ~194px wide with ~12px gap = 206px center-to-center
+    # - First item center at x=580px, last at x=2025px
+    # - First row center at y=747px
+    _GRID_LEFT = 0.1242
+    _GRID_TOP = 0.2986
+    _GRID_RIGHT = 0.5542
+    _GRID_BOTTOM = 0.6784
     _GRID_COLS = 8
     _GRID_ROWS = 4  # visible rows before scrolling
 
@@ -437,30 +438,28 @@ class WarehouseTransferTask(BaseEfTask):
                         continue
 
                     # Tooltip appears BELOW and to the RIGHT of the cursor.
-                    # Measured: text starts ~20px below cursor, extends ~110px down,
-                    # starts ~50px right of cursor, extends ~450px right.
-                    tooltip_x1 = min(w, int(cx_px + 50))
-                    tooltip_x2 = min(w, int(cx_px + 450))
-                    tooltip_y1 = max(0, int(cy_px + 20))
-                    tooltip_y2 = min(h, int(cy_px + 110))
+                    # Taller region captures subtitle lines like "Filled with Xircon Effluent".
+                    tooltip_x1 = min(w, int(cx_px + 48))
+                    tooltip_x2 = min(w, int(cx_px + 520))
+                    tooltip_y1 = max(0, int(cy_px + 15))
+                    tooltip_y2 = min(h, int(cy_px + 170))
 
                     row_captures.append((col, cx_px, cy_px, frame.copy(),
                                          (tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2)))
 
                 # Phase 2: OCR all captured frames (blocking calls happen here, cursor idle)
                 for col, cx_px, cy_px, frame, (tx1, ty1, tx2, ty2) in row_captures:
-                    # Save debug screenshots
-                    if scroll_round <= 1:
-                        try:
-                            debug_frame = frame.copy()
-                            cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (0, 255, 0), 3)
-                            cv2.circle(debug_frame, (cx_px, cy_px), 12, (0, 0, 255), -1)
-                            cv2.imwrite(str(debug_dir / f"r{scroll_round}_cell_{row}_{col}.png"), debug_frame)
-                            crop = frame[ty1:ty2, tx1:tx2]
-                            if crop.size > 0:
-                                cv2.imwrite(str(debug_dir / f"r{scroll_round}_tooltip_{row}_{col}.png"), crop)
-                        except Exception as e:
-                            self.log_info(f"[grid_scan] screenshot save failed: {e}")
+                    # Save debug screenshots for ALL rounds
+                    try:
+                        debug_frame = frame.copy()
+                        cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (0, 255, 0), 3)
+                        cv2.circle(debug_frame, (cx_px, cy_px), 12, (0, 0, 255), -1)
+                        cv2.imwrite(str(debug_dir / f"r{scroll_round}_cell_{row}_{col}.png"), debug_frame)
+                        crop = frame[ty1:ty2, tx1:tx2]
+                        if crop.size > 0:
+                            cv2.imwrite(str(debug_dir / f"r{scroll_round}_tooltip_{row}_{col}.png"), crop)
+                    except Exception as e:
+                        self.log_info(f"[grid_scan] screenshot save failed: {e}")
 
                     text = ocr_text(frame, box=(tx1, ty1, tx2, ty2), psm=6)
                     text = text.strip()
