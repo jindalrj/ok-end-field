@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import cv2
@@ -401,6 +402,11 @@ class WarehouseTransferTask(BaseEfTask):
         self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}, "
                       f"cell_size=({col_width:.3f}, {row_height:.3f})")
 
+        # Debug screenshot directory
+        debug_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "grid_scan_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        self.log_info(f"[grid_scan] debug screenshots -> {debug_dir}")
+
         for scroll_round in range(MAX_SCROLL_ROUNDS):
             self.log_info(f"[grid_scan] --- scroll round {scroll_round} ---")
             bottom_right_text = None
@@ -415,12 +421,13 @@ class WarehouseTransferTask(BaseEfTask):
 
                     # Hover using real cursor (required for tooltip to appear)
                     self._hover_absolute(cx_px, cy_px)
-                    self.sleep(0.55)  # tooltip takes ~0.5s to appear
+                    self.sleep(0.6)  # tooltip takes ~0.5s to appear
 
                     # Capture frame and OCR the tooltip region
                     self.next_frame()
                     frame = self.executor.frame
                     if frame is None:
+                        self.log_info(f"[grid_scan] ({row},{col}) frame is None!")
                         continue
 
                     # Tooltip box: above the cursor, spanning ~2x cell width
@@ -429,8 +436,28 @@ class WarehouseTransferTask(BaseEfTask):
                     tooltip_x1 = max(0, int((cx_rel - col_width * 1.5) * w))
                     tooltip_x2 = min(w, int((cx_rel + col_width * 1.5) * w))
 
+                    # Save debug screenshot with tooltip region drawn
+                    if scroll_round == 0 and row < 2:
+                        try:
+                            debug_frame = frame.copy()
+                            cv2.rectangle(debug_frame, (tooltip_x1, tooltip_y1), (tooltip_x2, tooltip_y2), (0, 255, 0), 2)
+                            cv2.circle(debug_frame, (cx_px, cy_px), 10, (0, 0, 255), -1)
+                            cv2.imwrite(str(debug_dir / f"r{scroll_round}_cell_{row}_{col}.png"), debug_frame)
+                            # Also save just the tooltip crop
+                            crop = frame[tooltip_y1:tooltip_y2, tooltip_x1:tooltip_x2]
+                            if crop.size > 0:
+                                cv2.imwrite(str(debug_dir / f"r{scroll_round}_tooltip_{row}_{col}.png"), crop)
+                        except Exception as e:
+                            self.log_info(f"[grid_scan] screenshot save failed: {e}")
+
                     text = ocr_text(frame, box=(tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2), psm=6)
                     text = text.strip()
+                    if not text and row == 0 and col == 0 and scroll_round == 0:
+                        # First cell empty = likely Tesseract not initialized
+                        from src.ocr.tesseract_ocr import _initialized
+                        self.log_info(f"[grid_scan] first cell empty! tesseract _initialized={_initialized}, "
+                                      f"tooltip_box=({tooltip_x1},{tooltip_y1},{tooltip_x2},{tooltip_y2}), "
+                                      f"frame_shape={frame.shape}")
 
                     if text:
                         self.log_info(f"[grid_scan] ({row},{col}) pos=({cx_rel:.3f},{cy_rel:.3f}) -> '{text}'")

@@ -106,10 +106,16 @@ jobs:
         run: |
           echo PYTHONIOENCODING=utf-8 >> $GITHUB_ENV
 
-      - name: Install Tesseract OCR
+      - name: Install and bundle Tesseract OCR
+        shell: pwsh
         run: |
           choco install tesseract --version=5.3.4.20240503 -y --no-progress
           echo "C:\Program Files\Tesseract-OCR" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # Bundle Tesseract into repo so it ships with the exe
+          $src = "C:\Program Files\Tesseract-OCR"
+          $dst = Join-Path $pwd "tesseract"
+          Copy-Item -Path $src -Destination $dst -Recurse -Force
+          Write-Host "Bundled Tesseract to $dst ($(Get-ChildItem $dst -Recurse -File | Measure-Object -Property Length -Sum | ForEach-Object { [math]::Round($_.Sum/1MB, 1) }) MB)"
 
       - name: Install dependencies
         run: |
