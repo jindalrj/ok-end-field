@@ -21,7 +21,11 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Local cache directory for Tesseract
+# Bundled Tesseract location (relative to the working directory)
+_BUNDLED_DIR = Path(__file__).resolve().parents[2] / "tesseract"
+_BUNDLED_EXE = _BUNDLED_DIR / "tesseract.exe"
+
+# Fallback cache directory for Tesseract (auto-download location)
 _CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "tesseract"
 _TESSERACT_EXE = _CACHE_DIR / "tesseract.exe"
 
@@ -29,17 +33,21 @@ _initialized = False
 
 
 def _find_tesseract() -> str | None:
-    """Find tesseract.exe - check common locations."""
-    # 1. Check our cache
+    """Find tesseract.exe - check bundled, cache, PATH, and common locations."""
+    # 1. Check bundled with app (placed by build workflow)
+    if _BUNDLED_EXE.exists():
+        return str(_BUNDLED_EXE)
+
+    # 2. Check download cache
     if _TESSERACT_EXE.exists():
         return str(_TESSERACT_EXE)
 
-    # 2. Check PATH
+    # 3. Check PATH
     tesseract_in_path = shutil.which("tesseract")
     if tesseract_in_path:
         return tesseract_in_path
 
-    # 3. Check common Windows install locations
+    # 4. Check common Windows install locations
     common_paths = [
         Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
         Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),

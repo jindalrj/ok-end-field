@@ -241,10 +241,12 @@ class RuntimeMixin:
         """
         if feature is not None and feature_name is None:
             feature_name = feature
-        if isinstance(feature_name, (list, tuple)):
-            feature_name = [self.get_feature_by_resolution(name) for name in feature_name]
-        else:
-            feature_name = self.get_feature_by_resolution(feature_name)
+        # Skip resolution-based feature lookup when a custom template is provided
+        if template is None:
+            if isinstance(feature_name, (list, tuple)):
+                feature_name = [self.get_feature_by_resolution(name) for name in feature_name]
+            else:
+                feature_name = self.get_feature_by_resolution(feature_name)
         result = super().find_feature(feature_name, horizontal_variance, vertical_variance, threshold, use_gray_scale, x,
                                     y, to_x, to_y, width, height, box, canny_lower, canny_higher, frame_processor,
                                     template, match_method, screenshot, mask_function, frame, limit, target_height)
