@@ -42,6 +42,10 @@ def _find_tesseract() -> str | None:
         exe = bundled_dir / "tesseract.exe"
         if exe.exists():
             return str(exe)
+        # Also check one level deeper (Copy-Item may nest the folder)
+        if bundled_dir.exists():
+            for sub_exe in bundled_dir.rglob("tesseract.exe"):
+                return str(sub_exe)
 
     # 2. Check download cache
     if _TESSERACT_EXE.exists():
@@ -114,17 +118,28 @@ def _download_tesseract():
         ) from e
 
 
-def ensure_tesseract():
-    """Ensure Tesseract is available, downloading if needed."""
+def ensure_tesseract() -> str:
+    """Ensure Tesseract is available, downloading if needed.
+
+    Returns a diagnostic string describing what was found/configured.
+    Raises RuntimeError if tesseract cannot be found or installed.
+    """
     global _initialized
     if _initialized:
-        return
+        import pytesseract
+        return f"already initialized, cmd={pytesseract.pytesseract.tesseract_cmd}"
 
     tesseract_path = _find_tesseract()
-    if not tesseract_path:
+    diag_parts = [f"search={'found' if tesseract_path else 'NOT_FOUND'}"]
+    # Log where we looked
+    diag_parts.append(f"bundled_dirs={[str(d) for d in _BUNDLED_DIRS]}")
+    if tesseract_path:
+        diag_parts.append(f"path={tesseract_path}")
+    else:
         if sys.platform == "win32":
             _download_tesseract()
             tesseract_path = str(_TESSERACT_EXE)
+            diag_parts.append(f"downloaded_to={tesseract_path}")
         else:
             raise RuntimeError(
                 "Tesseract not found. Install via: brew install tesseract (macOS) "
@@ -139,22 +154,23 @@ def ensure_tesseract():
     tessdata = Path(tesseract_path).parent / "tessdata"
     if tessdata.exists():
         os.environ["TESSDATA_PREFIX"] = str(tessdata.parent)
+        diag_parts.append(f"tessdata=OK")
     else:
-        logger.warning(f"tessdata not found at {tessdata} - OCR may fail!")
+        diag_parts.append(f"tessdata=MISSING({tessdata})")
 
-    # Verify tesseract actually works
+    # Verify tesseract actually runs
     try:
-        version = subprocess.run(
+        result = subprocess.run(
             [tesseract_path, "--version"],
             capture_output=True, text=True, timeout=5
         )
-        logger.info(f"Tesseract configured: {tesseract_path} "
-                    f"(version: {version.stdout.splitlines()[0] if version.stdout else 'unknown'})")
+        ver = result.stdout.splitlines()[0] if result.stdout else "unknown"
+        diag_parts.append(f"version={ver}")
     except Exception as e:
-        logger.warning(f"Tesseract version check failed: {e}")
-        logger.info(f"Tesseract configured: {tesseract_path}")
+        diag_parts.append(f"version_check_FAILED={e}")
 
     _initialized = True
+    return ", ".join(diag_parts)
 
 
 def ocr_frame(frame: np.ndarray, box=None, psm: int = 6) -> list[dict]:
@@ -220,8 +236,8 @@ def ocr_frame(frame: np.ndarray, box=None, psm: int = 6) -> list[dict]:
         return []
 
 
-_ocr_call_count = 0
-_ocr_fail_logged = False
+# Diagnostic state accessible from the task via: from src.ocr.tesseract_ocr import _ocr_diag
+_ocr_diag = {"calls": 0, "errors": [], "last_error": ""}
 
 
 def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
@@ -236,12 +252,8 @@ def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
     Returns:
         Combined text string from all detections, or "" on any error
     """
-    global _ocr_call_count, _ocr_fail_logged
-
     if not _initialized:
-        if not _ocr_fail_logged:
-            logger.warning("ocr_text called but tesseract not initialized!")
-            _ocr_fail_logged = True
+        _ocr_diag["last_error"] = "not_initialized"
         return ""
 
     try:
@@ -267,17 +279,14 @@ def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
         if img_np.size == 0:
             return ""
 
-        _ocr_call_count += 1
+        _ocr_diag["calls"] += 1
         result = pytesseract.image_to_string(img_np, config=f'--psm {psm}').strip()
-
-        # Log first few calls for diagnostics
-        if _ocr_call_count <= 3:
-            logger.info(f"ocr_text call #{_ocr_call_count}: box={box}, "
-                        f"crop_size={img_np.shape}, result='{result[:60]}'")
-
         return result
     except Exception as e:
-        logger.warning(f"Tesseract ocr_text FAILED: {e}")
+        err_msg = f"{type(e).__name__}: {e}"
+        _ocr_diag["last_error"] = err_msg
+        if len(_ocr_diag["errors"]) < 5:
+            _ocr_diag["errors"].append(err_msg)
         return ""
 
 

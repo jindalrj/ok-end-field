@@ -411,6 +411,14 @@ class WarehouseTransferTask(BaseEfTask):
         self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}, "
                       f"cell_size=({col_width:.3f}, {row_height:.3f})")
 
+        # Verify OCR is functional with a direct test
+        from src.ocr.tesseract_ocr import _initialized as tess_ok
+        if not tess_ok:
+            self.log_info("[grid_scan] WARNING: tesseract _initialized=False, OCR will return empty!")
+        else:
+            import pytesseract
+            self.log_info(f"[grid_scan] tesseract cmd={pytesseract.pytesseract.tesseract_cmd}")
+
         # Debug screenshot directory
         debug_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "grid_scan_debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -464,10 +472,11 @@ class WarehouseTransferTask(BaseEfTask):
                     text = ocr_text(frame, box=(tx1, ty1, tx2, ty2), psm=6)
                     text = text.strip()
 
-                    if not text and row == 0 and col == 0 and scroll_round == 0:
-                        from src.ocr.tesseract_ocr import _initialized
-                        self.log_info(f"[grid_scan] first cell empty! tesseract _initialized={_initialized}, "
-                                      f"tooltip_box=({tx1},{ty1},{tx2},{ty2}), frame_shape={frame.shape}")
+                    if not text and col == 0 and scroll_round == 0:
+                        from src.ocr.tesseract_ocr import _initialized, _ocr_diag
+                        self.log_info(f"[grid_scan] ({row},{col}) empty! _initialized={_initialized}, "
+                                      f"box=({tx1},{ty1},{tx2},{ty2}), shape={frame.shape}, "
+                                      f"diag={_ocr_diag}")
 
                     if text:
                         self.log_info(f"[grid_scan] ({row},{col}) -> '{text}'")
@@ -520,10 +529,10 @@ class WarehouseTransferTask(BaseEfTask):
     def run(self):
         self.ensure_main()
         try:
-            ensure_tesseract()
-            self.log_info("[run] Tesseract OCR initialized")
+            diag = ensure_tesseract()
+            self.log_info(f"[run] Tesseract: {diag}")
         except Exception as e:
-            self.log_info(f"[run] Tesseract not available ({e}), using positional clicks only")
+            self.log_info(f"[run] Tesseract FAILED: {e}")
 
         from_key = str(self.config.get("发货仓库", "wuling")).strip()
         to_key = str(self.config.get("收货仓库", "valley4")).strip()
