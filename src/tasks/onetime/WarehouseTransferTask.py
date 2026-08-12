@@ -405,7 +405,7 @@ class WarehouseTransferTask(BaseEfTask):
         row_height = (self._GRID_BOTTOM - self._GRID_TOP) / self._GRID_ROWS
 
         seen_items = set()
-        last_bottom_right_text = None
+        last_top_left_text = None
         MAX_SCROLL_ROUNDS = 8
 
         self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}, "
@@ -426,7 +426,7 @@ class WarehouseTransferTask(BaseEfTask):
 
         for scroll_round in range(MAX_SCROLL_ROUNDS):
             self.log_info(f"[grid_scan] --- scroll round {scroll_round} ---")
-            bottom_right_text = None
+            top_left_text = None
 
             for row in range(self._GRID_ROWS):
                 # Phase 1: Hover each cell and capture frames (no OCR yet, smooth movement)
@@ -448,9 +448,9 @@ class WarehouseTransferTask(BaseEfTask):
                     # Tooltip appears BELOW and to the RIGHT of the cursor.
                     # Taller region captures subtitle lines like "Filled with Xircon Effluent".
                     tooltip_x1 = min(w, int(cx_px + 48))
-                    tooltip_x2 = min(w, int(cx_px + 520))
+                    tooltip_x2 = min(w, int(cx_px + 620))
                     tooltip_y1 = max(0, int(cy_px + 15))
-                    tooltip_y2 = min(h, int(cy_px + 170))
+                    tooltip_y2 = min(h, int(cy_px + 195))
 
                     row_captures.append((col, cx_px, cy_px, frame.copy(),
                                          (tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2)))
@@ -482,8 +482,8 @@ class WarehouseTransferTask(BaseEfTask):
                         self.log_info(f"[grid_scan] ({row},{col}) -> '{text}'")
                         seen_items.add(text.lower())
 
-                        if row == self._GRID_ROWS - 1 and col == self._GRID_COLS - 1:
-                            bottom_right_text = text
+                        if row == 0 and col == 0 and top_left_text is None:
+                            top_left_text = text
 
                         text_lower = text.lower()
                         for target in targets:
@@ -494,18 +494,20 @@ class WarehouseTransferTask(BaseEfTask):
                     else:
                         self.log_info(f"[grid_scan] ({row},{col}) empty")
 
-            # Check if we've hit the bottom (same content as last scroll)
-            if bottom_right_text and bottom_right_text == last_bottom_right_text:
-                self.log_info(f"[grid_scan] bottom-right unchanged ('{bottom_right_text}'), no more items")
+            # Check if we've hit the bottom (top-left same as previous round means
+            # scroll had no effect - we're at the end of the list)
+            if top_left_text and top_left_text == last_top_left_text:
+                self.log_info(f"[grid_scan] top-left unchanged ('{top_left_text}'), no more items")
                 break
-            last_bottom_right_text = bottom_right_text
+            last_top_left_text = top_left_text
 
-            # Scroll down to reveal more items (scroll ~3 rows worth)
+            # Scroll down to reveal next rows (scroll(-2) advances ~3.3 rows,
+            # giving ~0.7 row overlap with 4-row grid to avoid skipping)
             scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
             scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
             self._hover_absolute(scroll_x, scroll_y)
             self.sleep(0.2)
-            self.scroll(scroll_x, scroll_y, -3)
+            self.scroll(scroll_x, scroll_y, -2)
             self.sleep(1.2)
             # Discard stale frame so next_frame() returns fresh content
             self.next_frame()
