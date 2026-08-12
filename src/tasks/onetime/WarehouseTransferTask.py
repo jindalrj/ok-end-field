@@ -501,13 +501,17 @@ class WarehouseTransferTask(BaseEfTask):
                 break
             last_top_left_text = top_left_text
 
-            # Scroll down to reveal next rows (scroll(-2) advances ~3.3 rows,
-            # giving ~0.7 row overlap with 4-row grid to avoid skipping)
+            # Scroll down exactly 3 rows: use two scroll(-1) with pause between.
+            # Each notch scrolls ~1.67 rows in this game; two notches = ~3.3 rows.
+            # Single scroll(-1) + pause + scroll(-1) gives the game time to settle
+            # and results in exactly 3 rows advanced (1 row overlap with 4-row grid).
             scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
             scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
             self._hover_absolute(scroll_x, scroll_y)
             self.sleep(0.2)
-            self.scroll(scroll_x, scroll_y, -2)
+            self.scroll(scroll_x, scroll_y, -1)
+            self.sleep(0.5)
+            self.scroll(scroll_x, scroll_y, -1)
             self.sleep(1.2)
             # Discard stale frame so next_frame() returns fresh content
             self.next_frame()
