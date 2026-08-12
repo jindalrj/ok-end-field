@@ -157,15 +157,17 @@ def ensure_tesseract() -> str:
                 "or apt install tesseract-ocr (Linux)"
             )
 
-    # Configure pytesseract
+    # Configure pytesseract - resolve to absolute native path (avoids mixed slashes on Windows)
     import pytesseract
+    tesseract_path = str(Path(tesseract_path).resolve())
     pytesseract.pytesseract.tesseract_cmd = tesseract_path
 
-    # Set TESSDATA_PREFIX if needed
-    tessdata = Path(tesseract_path).parent / "tessdata"
+    # Set TESSDATA_PREFIX to the tessdata directory itself (not its parent).
+    # Must use OS-native path separators on Windows to avoid mixed-slash errors.
+    tessdata = Path(tesseract_path).resolve().parent / "tessdata"
     if tessdata.exists():
-        os.environ["TESSDATA_PREFIX"] = str(tessdata.parent)
-        diag_parts.append(f"tessdata=OK")
+        os.environ["TESSDATA_PREFIX"] = str(tessdata)
+        diag_parts.append(f"tessdata=OK({tessdata})")
     else:
         diag_parts.append(f"tessdata=MISSING({tessdata})")
 
