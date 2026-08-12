@@ -21,12 +21,22 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Bundled Tesseract locations (checked in order)
-# 1. Inside repo root (2 levels up from src/ocr/tesseract_ocr.py)
-_BUNDLED_DIR_REPO = Path(__file__).resolve().parents[2] / "tesseract"
-# 2. App-level directory (3 levels up, outside git checkout - survives git fetch/clean)
-_BUNDLED_DIR_APP = Path(__file__).resolve().parents[3] / "tesseract"
-_BUNDLED_DIRS = [_BUNDLED_DIR_REPO, _BUNDLED_DIR_APP]
+# Find bundled Tesseract by walking up from this file's location.
+# At runtime the structure is: .../data/apps/ok-ef/tesseract/tesseract.exe
+# and this file is at:          .../data/apps/ok-ef/<repo_or_working>/src/ocr/tesseract_ocr.py
+# We don't know exact depth, so check each ancestor for a sibling tesseract/ dir.
+def _find_bundled_dirs() -> list[Path]:
+    """Walk up from __file__ and collect any ancestor/tesseract/ dirs."""
+    dirs = []
+    p = Path(__file__).resolve().parent
+    for _ in range(6):  # up to 6 levels above src/ocr/
+        p = p.parent
+        candidate = p / "tesseract"
+        if candidate.is_dir():
+            dirs.append(candidate)
+    return dirs
+
+_BUNDLED_DIRS = _find_bundled_dirs()
 
 # Fallback cache directory for Tesseract (auto-download location)
 _CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "tesseract"
@@ -131,8 +141,9 @@ def ensure_tesseract() -> str:
 
     tesseract_path = _find_tesseract()
     diag_parts = [f"search={'found' if tesseract_path else 'NOT_FOUND'}"]
-    # Log where we looked
-    diag_parts.append(f"bundled_dirs={[str(d) for d in _BUNDLED_DIRS]}")
+    # Log where we looked so path issues are obvious
+    diag_parts.append(f"__file__={__file__}")
+    diag_parts.append(f"bundled={[str(d) for d in _BUNDLED_DIRS]}")
     if tesseract_path:
         diag_parts.append(f"path={tesseract_path}")
     else:
