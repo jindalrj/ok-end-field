@@ -378,6 +378,26 @@ class WarehouseTransferTask(BaseEfTask):
         lParam = win32api.MAKELONG(px_x, px_y)
         win32gui.PostMessage(interaction.hwnd, win32con.WM_MOUSEMOVE, 0, lParam)
 
+    def _scroll_precise(self, px_x: int, px_y: int, delta: int):
+        """Send WM_MOUSEWHEEL with exact delta for pixel-precise scrolling.
+
+        Args:
+            px_x, px_y: cursor position (client coords)
+            delta: wheel delta (negative = scroll down). 120 = 1 standard notch.
+        """
+        import win32gui
+        import ctypes
+        WM_MOUSEWHEEL = 0x020A
+        interaction = self.executor.interaction
+        interaction.try_activate()
+        # Position cursor first
+        abs_x, abs_y = interaction.capture.get_abs_cords(px_x, px_y)
+        win32api.SetCursorPos((abs_x, abs_y))
+        # WM_MOUSEWHEEL: wParam = MAKEWPARAM(keystate, delta), lParam = MAKELPARAM(screen_x, screen_y)
+        wParam = (delta & 0xFFFF) << 16  # high word = delta (signed, stored as unsigned 16-bit)
+        lParam = win32api.MAKELONG(abs_x, abs_y)  # screen coords for WM_MOUSEWHEEL
+        win32gui.PostMessage(interaction.hwnd, WM_MOUSEWHEEL, wParam, lParam)
+
     def _scan_grid_for_item(self, item_key_zh: str):
         """
         Scan the item grid by hovering each cell and reading the tooltip via OCR.
@@ -501,17 +521,15 @@ class WarehouseTransferTask(BaseEfTask):
                 break
             last_top_left_text = top_left_text
 
-            # Scroll down exactly 3 rows: use two scroll(-1) with pause between.
-            # Each notch scrolls ~1.67 rows in this game; two notches = ~3.3 rows.
-            # Single scroll(-1) + pause + scroll(-1) gives the game time to settle
-            # and results in exactly 3 rows advanced (1 row overlap with 4-row grid).
+            # Scroll down exactly 3 rows using precise WM_MOUSEWHEEL delta.
+            # Measured: 1 notch (120 delta) = 1.667 rows = 342px.
+            # 3 rows = 615px = 1.8 notches = delta 216.
+            # This gives 1 row overlap with the 4-row grid (no items skipped).
             scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
             scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
             self._hover_absolute(scroll_x, scroll_y)
             self.sleep(0.2)
-            self.scroll(scroll_x, scroll_y, -1)
-            self.sleep(0.5)
-            self.scroll(scroll_x, scroll_y, -1)
+            self._scroll_precise(scroll_x, scroll_y, -216)
             self.sleep(1.2)
             # Discard stale frame so next_frame() returns fresh content
             self.next_frame()
