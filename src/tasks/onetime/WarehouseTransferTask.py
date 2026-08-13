@@ -425,8 +425,8 @@ class WarehouseTransferTask(BaseEfTask):
     def _fuzzy_match(ocr_text: str, target: str) -> bool:
         """Check if OCR text matches target, tolerating common Tesseract errors.
 
-        Handles: substring containment, and SequenceMatcher ratio >= 0.82
-        for the title portion (tolerates 1-2 char errors in a typical item name).
+        Handles: substring containment, parenthetical items (e.g. "Hetonite Bottle (Clean Water)"
+        matched against "hetonite bottle | clean water"), and SequenceMatcher ratio >= 0.82.
         """
         if not ocr_text or not target:
             return False
@@ -435,14 +435,36 @@ class WarehouseTransferTask(BaseEfTask):
             return True
         # Clean OCR: strip trailing non-alpha, leading junk
         import re
-        clean = re.sub(r'[^a-z0-9\s\'\-\[\]]', '', ocr_text).strip()
-        # Compare title portion only (before |)
-        title_part = clean.split('|')[0].strip() if '|' in clean else clean
+        clean = re.sub(r'[^a-z0-9\s\'\-\[\]|()]', '', ocr_text).strip()
+        # Split on | (title | description from band OCR)
+        parts = [p.strip() for p in clean.split('|')]
+        title_part = parts[0]
+        desc_part = parts[1] if len(parts) > 1 else ""
+
         if target in title_part or title_part in target:
             return True
-        # Fuzzy match: ratio >= 0.82 catches "powdel"→"powder" but rejects
-        # different items with shared prefix like "dense carbon" vs "dense originium"
+
+        # For parenthetical targets like "hetonite bottle (clean water)",
+        # reconstruct from title + desc bands
+        if '(' in target and desc_part:
+            # Extract base and fill from target: "hetonite bottle (clean water)"
+            paren_match = re.match(r'^(.+?)\s*\((.+?)\)$', target)
+            if paren_match:
+                target_base = paren_match.group(1).strip()
+                target_fill = paren_match.group(2).strip()
+                from difflib import SequenceMatcher
+                base_ratio = SequenceMatcher(None, title_part, target_base).ratio()
+                fill_ratio = SequenceMatcher(None, desc_part, target_fill).ratio()
+                if base_ratio >= 0.82 and fill_ratio >= 0.75:
+                    return True
+
+        # Fuzzy match on full combined text vs target
+        combined = f"{title_part} {desc_part}".strip() if desc_part else title_part
         from difflib import SequenceMatcher
+        ratio = SequenceMatcher(None, combined, target).ratio()
+        if ratio >= 0.82:
+            return True
+        # Also try title alone
         ratio = SequenceMatcher(None, title_part, target).ratio()
         return ratio >= 0.82
 
