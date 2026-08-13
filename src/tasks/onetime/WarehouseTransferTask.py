@@ -84,31 +84,26 @@ class WarehouseTransferTask(BaseEfTask):
             {
                 "发货仓库": "valley4",
                 "收货仓库": "wuling",
-                "物品": "蓝铁矿",
+                "物品": "Dense Originium Powder",
                 "转移轮次": 10,
-                # "最小保留数量": 1000,
             }
         )
         self.config_description.update(
             {
-                "发货仓库": "从这个仓库拿货",
-                "收货仓库": "转运到这个仓库",
-                "物品": "选择要转移的物品",
-                "转移轮次": "倒货的轮次",
-                # "最小保留数量": "当识别到当前数量小于该值时停止任务并通知",
+                "发货仓库": "Source depot (transfer from)",
+                "收货仓库": "Destination depot (transfer to)",
+                "物品": "Item to transfer (English name)",
+                "转移轮次": "Number of transfer rounds",
             }
         )
         _location_keys = list(_LOCATIONS.get("zh_CN", {}).keys())
         self.config_type["发货仓库"] = {"type": "drop_down", "options": _location_keys}
         self.config_type["收货仓库"] = {"type": "drop_down", "options": _location_keys}
-        # Use all items that have template images available
-        template_map = _load_item_template_map()
-        available_items = [name for name in template_map if name in item_to_warehouse_dict]
-        if not available_items:
-            available_items = list(item_to_warehouse_dict.keys())
+        # Item dropdown uses English game names
+        _en_items = sorted(ITEM_GAME_ENGLISH.values())
         self.config_type["物品"] = {
             "type": "drop_down",
-            "options": available_items,
+            "options": _en_items,
         }
         self._template_cache: dict[str, object] = {}
         self._item_name_cache: dict[str, str] | None = None
@@ -148,12 +143,19 @@ class WarehouseTransferTask(BaseEfTask):
         return (bgr, mask)
 
     def _to_one_type_page(self, item_name: str):
-        category_en_name = ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH.get(item_to_warehouse_dict.get(item_name, ""), "")
+        # Resolve English game name to Chinese if needed for category lookup
+        zh_name = item_name
+        if item_name not in item_to_warehouse_dict:
+            _en_to_zh = {v.lower(): k for k, v in ITEM_GAME_ENGLISH.items()}
+            zh_name = _en_to_zh.get(item_name.lower(), item_name)
+        category_zh = item_to_warehouse_dict.get(zh_name, "")
+        category_en_name = ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH.get(category_zh, "")
         if not category_en_name:
-            raise ValueError(f"物品 {item_name} 无法找到分类，无法定位图标")
+            self.log_info(f"[category] cannot find category for '{item_name}', skipping navigation")
+            return
         result = self.find_feature(feature=f"{category_en_name}_icon")
         if not result:
-            self.log_info(f"物品 {item_name} 无法找到分类图标,可能已经进入该分类页")
+            self.log_info(f"[category] icon '{category_en_name}_icon' not found, may already be on correct page")
         if result:
             self.click(result[0])
             self.wait_ui_stable(refresh_interval=0.2)
@@ -399,6 +401,27 @@ class WarehouseTransferTask(BaseEfTask):
         win32gui.PostMessage(interaction.hwnd, WM_MOUSEWHEEL, wParam, lParam)
 
     @staticmethod
+    def _parse_count(text: str) -> int:
+        """Parse item count from OCR text like '23', '80K', '7.74K', '1.2M'."""
+        import re
+        if not text:
+            return 0
+        text = text.strip().upper().replace(',', '').replace(' ', '')
+        # Remove any non-numeric/KM characters
+        text = re.sub(r'[^0-9.KM]', '', text)
+        if not text:
+            return 0
+        try:
+            if text.endswith('K'):
+                return int(float(text[:-1]) * 1000)
+            elif text.endswith('M'):
+                return int(float(text[:-1]) * 1000000)
+            else:
+                return int(float(text))
+        except (ValueError, IndexError):
+            return 0
+
+    @staticmethod
     def _fuzzy_match(ocr_text: str, target: str) -> bool:
         """Check if OCR text matches target, tolerating common Tesseract errors.
 
@@ -428,17 +451,16 @@ class WarehouseTransferTask(BaseEfTask):
         Scan the item grid by hovering each cell and reading the tooltip via OCR.
 
         Moves left-to-right, top-to-bottom. After scanning all visible rows,
-        scrolls down and repeats. Stops when target is found or bottom-right
-        cell has been seen twice (indicating no more items to scroll).
+        scrolls down and repeats. Returns last (bottom-right) match found.
 
         Args:
-            item_key_zh: Chinese item name from config (used for matching)
+            item_key_zh: Item identifier (Chinese name OR English game name)
 
         Returns a Box-like object at the item center, or None.
         """
         from ok.feature.Box import Box
 
-        # Build match targets: Chinese name + game English name + internal code name
+        # Build match targets from all available name forms
         targets = [item_key_zh.lower()]
         game_en = ITEM_GAME_ENGLISH.get(item_key_zh, "")
         if game_en:
@@ -446,6 +468,17 @@ class WarehouseTransferTask(BaseEfTask):
         en_code = ITEM_TRANSLATION_DICT.get(item_key_zh, "")
         if en_code:
             targets.append(en_code.replace("_", " ").lower())
+        # If input was already an English name, add it directly
+        if item_key_zh.lower() not in [t for t in targets]:
+            pass  # already included
+        # Also check if input matches a game English name (user typed English)
+        _en_to_zh = {v.lower(): k for k, v in ITEM_GAME_ENGLISH.items()}
+        if item_key_zh.lower() in _en_to_zh:
+            zh_key = _en_to_zh[item_key_zh.lower()]
+            targets.append(zh_key)
+            code = ITEM_TRANSLATION_DICT.get(zh_key, "")
+            if code:
+                targets.append(code.replace("_", " ").lower())
 
         w, h = self.width, self.height
         col_width = (self._GRID_RIGHT - self._GRID_LEFT) / self._GRID_COLS
@@ -453,6 +486,8 @@ class WarehouseTransferTask(BaseEfTask):
 
         seen_items = set()
         last_top_left_text = None
+        last_match = None       # prefer bottom-right match
+        last_match_count = 0
         MAX_SCROLL_ROUNDS = 8
 
         self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}, "
@@ -516,13 +551,22 @@ class WarehouseTransferTask(BaseEfTask):
                     except Exception as e:
                         self.log_info(f"[grid_scan] screenshot save failed: {e}")
 
+                    # OCR item count from bottom-left of cell (doesn't overlap tooltip)
+                    half_cw = int(col_width * w / 2)
+                    half_ch = int(row_height * h / 2)
+                    cnt_x1 = max(0, cx_px - half_cw)
+                    cnt_x2 = cx_px - 10
+                    cnt_y1 = cy_px + half_ch - 45
+                    cnt_y2 = min(h, cy_px + half_ch + 5)
+                    count_str = ocr_text(frame, box=(cnt_x1, cnt_y1, cnt_x2, cnt_y2), psm=7)
+                    count_str = count_str.strip().split('\n')[0].strip()
+                    item_count = self._parse_count(count_str)
+
                     # Split tooltip into 3 vertical bands to avoid mixing lines.
-                    # Measured from tooltips: title y=18-57, category y=78-108, desc y=132-165
-                    # in a 180px crop. Scale proportionally for current crop height.
                     crop_h = ty2 - ty1
                     band1_end = int(crop_h * 0.33)    # title ends at ~33%
                     band2_end = int(crop_h * 0.58)    # category ends at ~58%
-                    title_text = ocr_text(frame, box=(tx1, ty1, tx1 + (tx2 - tx1), ty1 + band1_end), psm=7)
+                    title_text = ocr_text(frame, box=(tx1, ty1, tx2, ty1 + band1_end), psm=7)
                     title_text = title_text.strip().split('\n')[0].strip()  # first line only
 
                     if not title_text and col == 0 and scroll_round == 0:
@@ -536,21 +580,30 @@ class WarehouseTransferTask(BaseEfTask):
                         desc_text = ocr_text(frame, box=(tx1, ty1 + band2_end, tx2, ty2), psm=7)
                         desc_text = desc_text.strip().split('\n')[0].strip()
                         full_text = title_text if not desc_text else f"{title_text} | {desc_text}"
+                        count_label = f" x{item_count}" if item_count else ""
 
-                        self.log_info(f"[grid_scan] ({row},{col}) -> '{full_text}'")
+                        self.log_info(f"[grid_scan] ({row},{col}) -> '{full_text}'{count_label}")
                         seen_items.add(title_text.lower())
 
                         if row == 0 and col == 0 and top_left_text is None:
                             top_left_text = title_text
 
+                        # Track matches but prefer bottom-right (last match in grid)
                         match_text = full_text.lower()
                         for target in targets:
                             if self._fuzzy_match(match_text, target):
-                                self.log_info(f"[grid_scan] FOUND '{target}' in '{full_text}' at ({row},{col})")
-                                return Box(cx_px - int(col_width * w / 2), cy_px - int(row_height * h / 2),
-                                           int(col_width * w), int(row_height * h), name=title_text)
+                                last_match = Box(cx_px - half_cw, cy_px - half_ch,
+                                                 int(col_width * w), int(row_height * h), name=title_text)
+                                last_match_count = item_count
+                                self.log_info(f"[grid_scan] MATCH '{target}' in '{full_text}' at ({row},{col}){count_label}")
+                                break
                     else:
                         self.log_info(f"[grid_scan] ({row},{col}) empty")
+
+            # If we found a match in this round, return the last (bottom-right) one
+            if last_match:
+                self.log_info(f"[grid_scan] returning bottom-right match: '{last_match.name}' x{last_match_count}")
+                return last_match
 
             # Check if we've hit the bottom (top-left same as previous round means
             # scroll had no effect - we're at the end of the list)
@@ -595,43 +648,53 @@ class WarehouseTransferTask(BaseEfTask):
         except Exception as e:
             self.log_info(f"[run] Tesseract FAILED: {e}")
 
-        from_key = str(self.config.get("发货仓库", "wuling")).strip()
-        to_key = str(self.config.get("收货仓库", "valley4")).strip()
+        from_key = str(self.config.get("发货仓库", "valley4")).strip()
+        to_key = str(self.config.get("收货仓库", "wuling")).strip()
         if from_key == to_key:
-            raise RuntimeError("发货仓库与收货仓库不能相同")
+            raise RuntimeError("Source and destination depot cannot be the same")
 
-        item_key = str(self.config.get("物品", "")).strip()
-        if not item_key:
-            raise RuntimeError("未选择物品")
+        item_config = str(self.config.get("物品", "")).strip()
+        if not item_config:
+            raise RuntimeError("No item selected")
+
+        # Resolve English game name to Chinese key (for category navigation)
+        # Build reverse mapping: game_english -> chinese_key
+        _en_to_zh = {v.lower(): k for k, v in ITEM_GAME_ENGLISH.items()}
+        item_key_zh = _en_to_zh.get(item_config.lower(), item_config)
+        # item_key for scan: use whatever was configured (works with both EN and ZH)
+        item_key = item_key_zh
+
         max_times = int(self.config.get("转移轮次", 10))
         locale = self._get_locale()
-        self.log_info(f"[run] from={from_key}, to={to_key}, item={item_key}, rounds={max_times}, locale={locale}, resolution={self.width}x{self.height}")
+        self.log_info(f"[run] from={from_key}, to={to_key}, item={item_config} (zh={item_key_zh}), "
+                      f"rounds={max_times}, locale={locale}, resolution={self.width}x{self.height}")
         self.press_key("b")
         self.sleep(2.0)
-        # Wait for depot UI to appear (try OCR, but don't block on it)
+        # Wait for depot UI to appear
         self.wait_until(
             lambda: self._detect_current_location() is not None,
             time_out=5,
             raise_if_not_found=False,
         )
         while True:
+            # Always check current depot and switch if needed
             current = self._detect_current_location()
             if current != from_key:
-                self.log_info(f"当前仓库={current}，切换到发货仓库={from_key}")
+                self.log_info(f"[run] current depot={current}, switching to source={from_key}")
                 self._switch_location(from_key)
             self._to_one_type_page(item_key)
-            self.log_info(f"处理物品: {item_key}")
+            self.log_info(f"[run] scanning for: {item_config}")
 
             # Find item by grid-scanning with hover + OCR
-            # Match against both Chinese name and English tooltip name
             icon = self._scan_grid_for_item(item_key)
 
             if not icon:
-                raise RuntimeError(f"未找到物品图标（网格扫描后仍失败）：{item_key}")
+                self.log_info(f"[run] item not found: {item_config}")
+                break
             self._ctrl_click(icon)
             self.sleep(0.35)
 
-            self.log_info(f"切换到收货仓库={to_key}")
+            self.log_info(f"[run] switching to destination={to_key}")
             self._switch_location(to_key)
 
             store_text = self.lang.WarehouseTransferTask.k_d661f6da
