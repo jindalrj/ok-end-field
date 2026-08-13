@@ -425,46 +425,87 @@ class WarehouseTransferTask(BaseEfTask):
     def _fuzzy_match(ocr_text: str, target: str) -> bool:
         """Check if OCR text matches target, tolerating common Tesseract errors.
 
-        Handles: substring containment, parenthetical items (e.g. "Hetonite Bottle (Clean Water)"
-        matched against "hetonite bottle | clean water"), and SequenceMatcher ratio >= 0.82.
+        For simple items: fuzzy match title against target (ratio >= 0.82).
+        For parenthetical items like "Hetonite Bottle (Clean Water)":
+          - Decompose target into base ("Hetonite Bottle") and fill ("Clean Water")
+          - Match title band against base
+          - Match description band (with "Filled with " prefix stripped) against fill
+        For short items (LC/SC/HC batteries): require exact prefix match on the
+        capitalized abbreviation to avoid LC matching SC.
         """
         if not ocr_text or not target:
             return False
-        # Exact substring match
-        if target in ocr_text or ocr_text in target:
-            return True
-        # Clean OCR: strip trailing non-alpha, leading junk
         import re
-        clean = re.sub(r'[^a-z0-9\s\'\-\[\]|()]', '', ocr_text).strip()
-        # Split on | (title | description from band OCR)
+        from difflib import SequenceMatcher
+
+        # Exact full-string substring match - but skip if target has special
+        # delimiters that require structured matching (parens, brackets)
+        has_structured = '(' in target or '[' in target
+        if not has_structured and (target in ocr_text or ocr_text in target):
+            return True
+
+        # Clean OCR text
+        clean = re.sub(r'[^a-z0-9\s\'\-\[\]|]', '', ocr_text).strip()
+        # Split on | separator (title | description from band OCR)
         parts = [p.strip() for p in clean.split('|')]
         title_part = parts[0]
         desc_part = parts[1] if len(parts) > 1 else ""
 
-        if target in title_part or title_part in target:
-            return True
+        # Strip "filled with " prefix from description (game shows "Filled with Clean Water")
+        desc_content = re.sub(r'^filled with\s+', '', desc_part, flags=re.IGNORECASE).strip()
 
-        # For parenthetical targets like "hetonite bottle (clean water)",
-        # reconstruct from title + desc bands
-        if '(' in target and desc_part:
-            # Extract base and fill from target: "hetonite bottle (clean water)"
+        # For parenthetical targets: decompose and match parts separately.
+        # Must check BEFORE simple substring match to avoid "hetonite bottle" matching
+        # "hetonite bottle (clean water)" when the fill doesn't match.
+        if '(' in target:
             paren_match = re.match(r'^(.+?)\s*\((.+?)\)$', target)
             if paren_match:
                 target_base = paren_match.group(1).strip()
                 target_fill = paren_match.group(2).strip()
-                from difflib import SequenceMatcher
                 base_ratio = SequenceMatcher(None, title_part, target_base).ratio()
-                fill_ratio = SequenceMatcher(None, desc_part, target_fill).ratio()
-                if base_ratio >= 0.82 and fill_ratio >= 0.75:
-                    return True
+                # Only proceed if title matches the base name
+                if base_ratio >= 0.82:
+                    # Must have description to confirm the fill content
+                    if desc_content:
+                        fill_ratio = SequenceMatcher(None, desc_content, target_fill).ratio()
+                        return fill_ratio >= 0.80
+                    # No description available - base match alone is not enough
+                    # for filled containers (would confuse empty vs filled)
+                    return False
+                return False
 
-        # Fuzzy match on full combined text vs target
-        combined = f"{title_part} {desc_part}".strip() if desc_part else title_part
-        from difflib import SequenceMatcher
-        ratio = SequenceMatcher(None, combined, target).ratio()
-        if ratio >= 0.82:
+        # Short items with uppercase prefixes (LC/SC/HC) - require exact prefix
+        short_prefix_match = re.match(r'^([A-Z]{2})\s+', target.strip(), re.IGNORECASE)
+        if short_prefix_match:
+            target_prefix = short_prefix_match.group(1).lower()
+            title_prefix_match = re.match(r'^([a-z]{2})\s+', title_part)
+            if title_prefix_match:
+                if title_prefix_match.group(1) != target_prefix:
+                    return False
+            # Check the rest with fuzzy
+            ratio = SequenceMatcher(None, title_part, target).ratio()
+            return ratio >= 0.85
+
+        # For bracket items like "Buck Capsule [A]" - require exact bracket content
+        bracket_match = re.match(r'^(.+?)\s*\[(.+?)\]$', target)
+        if bracket_match:
+            target_base = bracket_match.group(1).strip()
+            target_grade = bracket_match.group(2).strip()
+            # Must find exact bracket content in OCR
+            title_bracket = re.search(r'\[(.+?)\]', title_part)
+            if title_bracket:
+                if title_bracket.group(1).strip().lower() != target_grade.lower():
+                    return False
+                title_base = re.sub(r'\s*\[.+?\]', '', title_part).strip()
+                return SequenceMatcher(None, title_base, target_base).ratio() >= 0.82
+            # No bracket in OCR - fuzzy match full string
+            return SequenceMatcher(None, title_part, target).ratio() >= 0.85
+
+        # Substring match (safe here - no parens/brackets in target)
+        if target in title_part or title_part in target:
             return True
-        # Also try title alone
+
+        # Standard fuzzy match for non-parenthetical items
         ratio = SequenceMatcher(None, title_part, target).ratio()
         return ratio >= 0.82
 
