@@ -10,6 +10,7 @@ This module:
 """
 
 import os
+import re
 import sys
 import shutil
 import logging
@@ -303,14 +304,15 @@ def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
         return ""
 
 
-def ocr_match(frame: np.ndarray, box, target: str, psm: int = 6) -> bool:
+def ocr_match(frame: np.ndarray, box, target, psm: int = 6) -> bool:
     """
     Check if target text appears in the specified region.
 
     Args:
         frame: BGR numpy array (game frame)
         box: (x1, y1, x2, y2) pixel coordinates
-        target: Text to search for (case-insensitive substring match)
+        target: Text to search for — accepts str (substring match) or
+                re.Pattern (regex match), both case-insensitive.
 
     Returns:
         True if target text found in region, False on any error
@@ -318,4 +320,6 @@ def ocr_match(frame: np.ndarray, box, target: str, psm: int = 6) -> bool:
     text = ocr_text(frame, box=box, psm=psm)
     if not text:
         return False
+    if isinstance(target, re.Pattern):
+        return bool(target.search(text))
     return target.lower() in text.lower()

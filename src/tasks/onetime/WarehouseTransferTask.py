@@ -16,7 +16,8 @@ from src.data.zh_en import ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH, ITEM_TRANSLATION_DI
 from src.core.BaseEfTask import BaseEfTask
 from src.icons import Icons
 from src.ocr import ocr_text, ocr_match, ocr_frame, ensure_tesseract
-from src.ocr.tesseract_ocr import _initialized as _tess_initialized, _ocr_diag
+from src.ocr import tesseract_ocr as _tess_mod
+from src.ocr.tesseract_ocr import _ocr_diag
 from src.tasks.onetime.item_matcher import matches as item_matches
 
 # Maps Chinese item name -> template image filename (without .png) in assets/items/images/
@@ -357,16 +358,14 @@ class WarehouseTransferTask(BaseEfTask):
         self.sleep(0.5)
 
     # Grid layout constants (relative to full 3840x2160 game frame).
-    # Measured via OpenCV contour detection on item slot borders:
-    # - Item slots are ~194px wide with ~12px gap = 206px center-to-center
-    # - First item center at x=580px, last at x=2025px
-    # - First row center at y=747px
+    # Initial estimates - refined at runtime by _measure_grid_from_contours().
     _GRID_LEFT = 0.1242
     _GRID_TOP = 0.2986
     _GRID_RIGHT = 0.5542
     _GRID_BOTTOM = 0.6784
     _GRID_COLS = 8
     _GRID_ROWS = 4  # visible rows before scrolling
+    _measured_row_height_px: int | None = None  # set by contour measurement
 
     def _hover_absolute(self, px_x: int, px_y: int):
         """Move the real cursor AND send WM_MOUSEMOVE to trigger game tooltip."""
@@ -391,6 +390,109 @@ class WarehouseTransferTask(BaseEfTask):
         wParam = (delta & 0xFFFF) << 16
         lParam = win32api.MAKELONG(abs_x, abs_y)
         win32gui.PostMessage(interaction.hwnd, 0x020A, wParam, lParam)
+
+    @staticmethod
+    def _extract_tooltip_text(crop: np.ndarray) -> tuple[str, str]:
+        """Detect tooltip panel via color, crop to text regions, OCR.
+
+        Uses HSV analysis to find the dark-grey tooltip panel, then isolates
+        white text within it. Skips description OCR if no text exists there.
+
+        Returns (title_text, desc_text).
+        """
+        h, w = crop.shape[:2]
+        if h < 20 or w < 50:
+            return "", ""
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        val = hsv[:, :, 2]
+        sat = hsv[:, :, 1]
+
+        # Panel mask: dark grey, low saturation
+        panel_mask = (val > 25) & (val < 95) & (sat < 45)
+        row_coverage = panel_mask.sum(axis=1) / w
+
+        # Find panel bottom: last row from top with >35% coverage (allow small gaps)
+        panel_rows = np.where(row_coverage > 0.35)[0]
+        if len(panel_rows) < 10:
+            return "", ""
+        panel_top = panel_rows[0]
+        panel_bottom = panel_top
+        for i in range(1, len(panel_rows)):
+            if panel_rows[i] - panel_rows[i - 1] > 15:
+                break
+            panel_bottom = panel_rows[i]
+
+        # Text mask: white pixels within panel
+        text_mask = (val > 170) & (sat < 60)
+        text_mask[panel_bottom:, :] = False  # ignore below panel
+
+        # Find text row clusters
+        text_row_counts = text_mask.sum(axis=1)
+        text_rows = np.where(text_row_counts > 5)[0]
+        if len(text_rows) == 0:
+            return "", ""
+
+        clusters = []
+        cluster_start = text_rows[0]
+        for i in range(1, len(text_rows)):
+            if text_rows[i] - text_rows[i - 1] > 8:
+                clusters.append((cluster_start, text_rows[i - 1]))
+                cluster_start = text_rows[i]
+        clusters.append((cluster_start, text_rows[-1]))
+
+        if not clusters:
+            return "", ""
+
+        # Title = first cluster
+        title_top, title_bottom = clusters[0]
+        title_top = max(0, title_top - 2)
+        title_bottom = min(h, title_bottom + 2)
+
+        # Horizontal bounds with gap detection (excludes adjacent cell content)
+        col_has_text = text_mask[title_top:title_bottom, :].sum(axis=0) > 0
+        title_cols = np.where(col_has_text)[0]
+        if len(title_cols) == 0:
+            return "", ""
+        title_left = max(0, title_cols[0] - 5)
+        title_right = title_cols[-1] + 5
+        last_col = title_cols[0]
+        for i in range(1, len(title_cols)):
+            if title_cols[i] - title_cols[i - 1] > 30:
+                title_right = last_col + 5
+                break
+            last_col = title_cols[i]
+        else:
+            title_right = min(w, title_cols[-1] + 5)
+
+        # OCR title
+        title_crop = crop[title_top:title_bottom, title_left:title_right]
+        title_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
+        title_inv = 255 - title_gray
+        _, title_bin = cv2.threshold(title_inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        title_padded = cv2.copyMakeBorder(title_bin, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+        title_text = ocr_text(title_padded, psm=7)
+        title_text = title_text.strip().split('\n')[0].strip()
+
+        # Description: 3rd+ text cluster (skip category which is 2nd)
+        desc_text = ""
+        if len(clusters) >= 3 and (panel_bottom - panel_top) > 100:
+            desc_top = max(0, clusters[2][0] - 2)
+            desc_bottom = min(panel_bottom, clusters[-1][1] + 2)
+            desc_col_mask = text_mask[desc_top:desc_bottom, :].sum(axis=0) > 0
+            desc_cols = np.where(desc_col_mask)[0]
+            if len(desc_cols) > 10:
+                dl = max(0, desc_cols[0] - 5)
+                dr = min(w, desc_cols[-1] + 5)
+                desc_crop = crop[desc_top:desc_bottom, dl:dr]
+                desc_gray = cv2.cvtColor(desc_crop, cv2.COLOR_BGR2GRAY)
+                desc_inv = 255 - desc_gray
+                _, desc_bin = cv2.threshold(desc_inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                desc_padded = cv2.copyMakeBorder(desc_bin, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+                desc_text = ocr_text(desc_padded, psm=7)
+                desc_text = desc_text.strip().split('\n')[0].strip()
+
+        return title_text, desc_text
 
     @staticmethod
     def _parse_count(text: str) -> int:
@@ -429,35 +531,6 @@ class WarehouseTransferTask(BaseEfTask):
                 targets.append(code.replace("_", " ").lower())
         return targets
 
-    def _ocr_cell(self, frame: np.ndarray, cx_px: int, cy_px: int,
-                  col_width: float, row_height: float, w: int, h: int,
-                  tx1: int, ty1: int, tx2: int, ty2: int) -> tuple[str, str, int]:
-        """OCR a single cell. Returns (title, description, count)."""
-        half_cw = int(col_width * w / 2)
-        half_ch = int(row_height * h / 2)
-
-        # Count from bottom-left of cell
-        cnt_x1 = max(0, cx_px - half_cw)
-        cnt_x2 = cx_px - 10
-        cnt_y1 = cy_px + half_ch - 45
-        cnt_y2 = min(h, cy_px + half_ch + 5)
-        count_str = ocr_text(frame, box=(cnt_x1, cnt_y1, cnt_x2, cnt_y2), psm=7)
-        count_str = count_str.strip().split('\n')[0].strip()
-        item_count = self._parse_count(count_str)
-
-        # 3-band tooltip split
-        crop_h = ty2 - ty1
-        band1_end = int(crop_h * 0.33)
-        band2_end = int(crop_h * 0.58)
-        title_text = ocr_text(frame, box=(tx1, ty1, tx2, ty1 + band1_end), psm=7)
-        title_text = title_text.strip().split('\n')[0].strip()
-
-        desc_text = ""
-        if title_text:
-            desc_text = ocr_text(frame, box=(tx1, ty1 + band2_end, tx2, ty2), psm=7)
-            desc_text = desc_text.strip().split('\n')[0].strip()
-
-        return title_text, desc_text, item_count
 
     def _scan_grid_for_item(self, item_key: str):
         """Scan item grid by hovering each cell, reading tooltip via OCR.
@@ -477,7 +550,7 @@ class WarehouseTransferTask(BaseEfTask):
         last_match_count = 0
 
         self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}")
-        if not _tess_initialized:
+        if not _tess_mod._initialized:
             self.log_info("[grid_scan] WARNING: tesseract not initialized!")
 
         debug_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "grid_scan_debug"
@@ -488,7 +561,7 @@ class WarehouseTransferTask(BaseEfTask):
             top_left_text = None
 
             for row in range(self._GRID_ROWS):
-                # Phase 1: Hover and capture
+                # Phase 1: Hover each cell to capture tooltip
                 row_captures = []
                 for col in range(self._GRID_COLS):
                     cx_px = int((self._GRID_LEFT + col_width * (col + 0.5)) * w)
@@ -505,21 +578,58 @@ class WarehouseTransferTask(BaseEfTask):
                     ty2 = min(h, cy_px + 225)
                     row_captures.append((col, cx_px, cy_px, frame.copy(), (tx1, ty1, tx2, ty2)))
 
-                # Phase 2: OCR batch
+                # Phase 2: Move cursor away from grid, capture clean frame for counts
+                safe_x = int(0.75 * w)  # backpack area (right side)
+                safe_y = int(0.50 * h)
+                self._hover_absolute(safe_x, safe_y)
+                self.sleep(0.4)
+                self.next_frame()
+                clean_frame = self.executor.frame
+                if clean_frame is None:
+                    clean_frame = row_captures[-1][3] if row_captures else None
+
+                # Phase 3: Read counts from clean frame (no tooltip overlay)
+                row_counts = {}
+                if clean_frame is not None:
+                    for col, cx_px, cy_px, _, _ in row_captures:
+                        cnt_x1 = max(0, cx_px - half_cw)
+                        cnt_x2 = cx_px + half_cw
+                        cnt_y1 = cy_px + half_ch - 55
+                        cnt_y2 = min(h, cy_px + half_ch + 5)
+                        count_str = ocr_text(clean_frame, box=(cnt_x1, cnt_y1, cnt_x2, cnt_y2), psm=7)
+                        count_str = count_str.strip().split('\n')[0].strip()
+                        row_counts[col] = self._parse_count(count_str)
+
+                # Phase 4: OCR tooltips for item names
                 for col, cx_px, cy_px, frame, (tx1, ty1, tx2, ty2) in row_captures:
+                    # OCR tooltip via preprocessing (color-based text isolation)
+                    tooltip_crop = frame[ty1:ty2, tx1:tx2]
+                    title_text, desc_text = self._extract_tooltip_text(tooltip_crop)
+
                     try:
                         debug_frame = frame.copy()
                         cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (0, 255, 0), 3)
                         cv2.circle(debug_frame, (cx_px, cy_px), 12, (0, 0, 255), -1)
                         cv2.imwrite(str(debug_dir / f"r{scroll_round}_cell_{row}_{col}.png"), debug_frame)
-                        crop = frame[ty1:ty2, tx1:tx2]
-                        if crop.size > 0:
-                            cv2.imwrite(str(debug_dir / f"r{scroll_round}_tooltip_{row}_{col}.png"), crop)
+                        if tooltip_crop.size > 0:
+                            cv2.imwrite(str(debug_dir / f"r{scroll_round}_tooltip_{row}_{col}.png"), tooltip_crop)
+                        # Save the preprocessed title image that was actually sent to OCR
+                        if title_text:
+                            h_c, w_c = tooltip_crop.shape[:2]
+                            hsv_c = cv2.cvtColor(tooltip_crop, cv2.COLOR_BGR2HSV)
+                            val_c = hsv_c[:, :, 2]
+                            sat_c = hsv_c[:, :, 1]
+                            t_mask = (val_c > 170) & (sat_c < 60)
+                            t_rows = np.where(t_mask.sum(axis=1) > 5)[0]
+                            if len(t_rows) > 0:
+                                t_top = max(0, t_rows[0] - 2)
+                                t_bot = min(h_c, t_rows[0] + 40)
+                                title_debug = tooltip_crop[t_top:t_bot, :]
+                                cv2.imwrite(str(debug_dir / f"r{scroll_round}_title_{row}_{col}.png"), title_debug)
                     except Exception:
                         pass
 
-                    title_text, desc_text, item_count = self._ocr_cell(
-                        frame, cx_px, cy_px, col_width, row_height, w, h, tx1, ty1, tx2, ty2)
+                    item_count = row_counts.get(col, 0)
 
                     if not title_text:
                         if col == 0 and scroll_round == 0:
@@ -557,7 +667,7 @@ class WarehouseTransferTask(BaseEfTask):
             scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
             self._hover_absolute(scroll_x, scroll_y)
             self.sleep(0.2)
-            self._scroll_precise(scroll_x, scroll_y, -240)
+            self._scroll_precise(scroll_x, scroll_y, -230)
             self.sleep(1.2)
             self.next_frame()
             self.sleep(0.3)
