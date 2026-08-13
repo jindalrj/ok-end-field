@@ -18,7 +18,11 @@ from src.icons import Icons
 from src.ocr import ocr_text, ocr_match, ensure_tesseract
 from src.ocr import tesseract_ocr as _tess_mod
 from src.ocr.tesseract_ocr import _ocr_diag
-from src.tasks.onetime.item_matcher import matches as item_matches
+from src.tasks.onetime.item_matcher import match_score as item_match_score, build_vocab
+
+# Vocabulary of all words in known English item names - lets the matcher
+# tell real leftover words ('ore', 'component') from OCR junk ('joo').
+_MATCH_VOCAB = build_vocab(ITEM_GAME_ENGLISH.values())
 
 # Maps Chinese item name -> template image filename (without .png) in assets/items/images/
 _ITEM_TEMPLATE_DIR = Path(__file__).resolve().parents[3] / "assets" / "items" / "images"
@@ -835,6 +839,7 @@ class WarehouseTransferTask(BaseEfTask):
         last_top_left_text = None
         last_match = None
         last_match_count = 0
+        best_score = 0.0
 
         self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}")
         if not _tess_mod._initialized:
@@ -933,16 +938,20 @@ class WarehouseTransferTask(BaseEfTask):
                         top_left_text = title_text
 
                     match_text = full_text.lower()
-                    for target in targets:
-                        if item_matches(match_text, target):
-                            last_match = Box(cx_px - half_cw, cy_px - half_ch,
-                                             int(col_width * w), int(row_height * h), name=title_text)
-                            last_match_count = item_count
-                            self.log_info(f"[grid_scan] MATCH '{target}' at ({row},{col}){count_label}")
-                            break
+                    score = max(item_match_score(match_text, t, _MATCH_VOCAB) for t in targets)
+                    # >= keeps the bottom-right-most cell among equal scores
+                    # (stacks fill top-left first, so the last cell is the
+                    # partial stack the game would deplete first).
+                    if score > 0.0 and score >= best_score:
+                        best_score = score
+                        last_match = Box(cx_px - half_cw, cy_px - half_ch,
+                                         int(col_width * w), int(row_height * h), name=title_text)
+                        last_match_count = item_count
+                        self.log_info(f"[grid_scan] MATCH at ({row},{col}) score={score:.3f}{count_label}")
 
             if last_match:
-                self.log_info(f"[grid_scan] returning: '{last_match.name}' x{last_match_count}")
+                self.log_info(f"[grid_scan] returning: '{last_match.name}' x{last_match_count} "
+                              f"score={best_score:.3f}")
                 return last_match
 
             if top_left_text and top_left_text == last_top_left_text:
@@ -974,6 +983,66 @@ class WarehouseTransferTask(BaseEfTask):
         finally:
             win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
         self.sleep(0.15)
+
+    # Backpack panel (right side of depot UI), measured on 4K screenshots:
+    # grid region x 2300-3398, y 639-1499; cell pitch 206.5px (rel 0.0538*w).
+    # Occupied cells are found via their saturated rarity bar (sat>80 &
+    # val>80) - scene fog is bright but DESATURATED, so this mask is
+    # fog-immune where brightness masks blow out. Verified identical
+    # results on 4 frames including heavy fog.
+    _BACKPACK_REGION = (0.599, 0.296, 0.885, 0.694)
+
+    def _deposit_backpack_item(self) -> bool:
+        """Ctrl-click the bottom-right-most occupied backpack cell.
+
+        Used instead of Quick Stash, which silently fails for some items.
+        Deposited items appear appended after existing backpack items, so
+        the bottom-right-most occupied cell is the item just withdrawn.
+        Returns True if an occupied cell was found and clicked.
+        """
+        self.next_frame()
+        frame = self.executor.frame
+        if frame is None:
+            return False
+        h, w = frame.shape[:2]
+        l, t, r, b = self._BACKPACK_REGION
+        x0, y0 = int(l * w), int(t * h)
+        x1, y1 = int(r * w), int(b * h)
+        region = frame[y0:y1, x0:x1]
+        if region.size == 0:
+            return False
+        cell = int(0.0538 * w)
+
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        mask = ((hsv[:, :, 1] > 80) & (hsv[:, :, 2] > 80)).astype(np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+        best = None  # (row_bucket, x, cx, cy)
+        boxes = []
+        for i in range(1, n):
+            bx, by, bw, bh, area = stats[i]
+            # Rarity bar spans the cell width; icon may merge with it but
+            # the component bbox bottom stays at the cell bottom.
+            if area < 2000 or not (0.7 * cell <= bw <= 1.1 * cell):
+                continue
+            bot = by + bh
+            cx = x0 + bx + bw // 2
+            cy = y0 + bot - cell // 2
+            boxes.append(((x0 + bx, y0 + by, x0 + bx + bw, y0 + bot), ""))
+            key = (bot // (cell // 2), bx)
+            if best is None or key > best[0]:
+                best = (key, cx, cy)
+
+        if best is None:
+            self._save_switch_debug("deposit_backpack", frame,
+                                    boxes=[((x0, y0, x1, y1), "no occupied cell")])
+            return False
+
+        _, cx, cy = best
+        self._save_switch_debug("deposit_backpack", frame, boxes=boxes, dot=(cx, cy))
+        self.log_info(f"[deposit] ctrl-clicking backpack item at ({cx},{cy})")
+        self._ctrl_click(Box(cx - cell // 2, cy - cell // 2, cell, cell, name="backpack_item"))
+        return True
 
     def run(self):
         self.ensure_main()
@@ -1032,44 +1101,31 @@ class WarehouseTransferTask(BaseEfTask):
             self.log_info(f"[run] switching to destination={to_key}")
             self._switch_location(to_key)
 
-            store_text = self.lang.WarehouseTransferTask.k_d661f6da
-            self.log_info(f"[store] clicking Quick Stash")
-            # Quick Stash pill measured on r0_cell_0_0.png (4K): x 0.632-0.739,
-            # y 0.699-0.738. Tesseract on the padded box reads 'Quick Stash'
-            # on 12/12 sampled grid frames. Matches original upstream box
-            # (0.64, 0.705, 0.69, 0.735) - NOT bottom-right (0.87, 0.90).
-            self.next_frame()
-            frame = self.executor.frame
-            store_found = False
-            if frame is not None:
-                h, w = frame.shape[:2]
-                store_box = (int(w * 0.625), int(h * 0.695), int(w * 0.75), int(h * 0.745))
-                text = ocr_text(frame, box=store_box, psm=7)
-                self._save_switch_debug(
-                    "quick_stash", frame,
-                    boxes=[(store_box, f"Tess: '{text}'")],
-                    dot=(int(0.67 * w), int(0.718 * h)))
-                if ocr_match(frame, store_box, store_text):
-                    self.log_info("[store] Tesseract confirmed Quick Stash visible")
-                    store_found = True
-
-            if store_found:
-                self.click_relative(0.67, 0.718)
-            else:
-                # Try framework OCR
-                store_btn = self.wait_ocr(
-                    box=self.box_of_screen(0.625, 0.695, 0.75, 0.745, name="onekey_store_area"),
-                    match=store_text,
-                    time_out=2,
-                    raise_if_not_found=False,
-                )
-                if store_btn:
-                    self.log_info("[store] framework OCR found, clicking")
-                    self.click(store_btn[0])
-                else:
-                    self.log_info("[store] OCR missed, using positional click")
-                    self.click_relative(0.67, 0.718)
-            # Quick Stash usually has NO confirm dialog - never blind-click
+            # Deposit via ctrl-click on the backpack item - Quick Stash
+            # silently fails for some items (game-side issue).
+            self.log_info("[store] depositing via backpack ctrl-click")
+            if not self._deposit_backpack_item():
+                # Fallback 1: fixed position of bottom-right backpack cell
+                # (user-measured red dot, rel 0.8430/0.6301 at 4K).
+                self.log_info("[store] detection failed, ctrl-clicking fixed position")
+                cell = int(0.0538 * self.width)
+                cx = int(0.8430 * self.width)
+                cy = int(0.6301 * self.height)
+                self._ctrl_click(Box(cx - cell // 2, cy - cell // 2, cell, cell,
+                                     name="backpack_fixed"))
+                # Fallback 2: Quick Stash button (works for most items).
+                # Pill measured on r0_cell_0_0.png (4K): x 0.632-0.739,
+                # y 0.699-0.738.
+                store_text = self.lang.WarehouseTransferTask.k_d661f6da
+                self.next_frame()
+                frame = self.executor.frame
+                if frame is not None:
+                    h, w = frame.shape[:2]
+                    store_box = (int(w * 0.625), int(h * 0.695), int(w * 0.75), int(h * 0.745))
+                    if ocr_match(frame, store_box, store_text):
+                        self.log_info("[store] fallback: clicking Quick Stash")
+                        self.click_relative(0.67, 0.718)
+            # Deposit usually has NO confirm dialog - never blind-click
             self._maybe_click_confirm(positional_fallback=False)
             max_times -= 1
             if max_times <= 0:
