@@ -268,8 +268,13 @@ class WarehouseTransferTask(BaseEfTask):
         except Exception:
             pass
 
-    def _maybe_click_confirm(self):
-        """Click Confirm button if it appears (Tesseract primary, positional fallback)."""
+    def _maybe_click_confirm(self, positional_fallback: bool = True):
+        """Click Confirm button if it appears (Tesseract primary, positional fallback).
+
+        positional_fallback=False: only click when OCR actually finds
+        Confirm. Used after Quick Stash where usually NO confirm dialog
+        appears - a blind click at (0.79, 0.81) lands in the backpack grid.
+        """
         confirm_text = self.lang.WarehouseTransferTask.k_b56d9ac6
         self.next_frame()
         frame = self.executor.frame
@@ -302,6 +307,10 @@ class WarehouseTransferTask(BaseEfTask):
             self.click(hits[0])
             self.sleep(0.5)
             return True
+
+        if not positional_fallback:
+            self.log_info("[confirm] OCR missed, no confirm present - skipping")
+            return False
 
         # Positional fallback
         self.log_info("[confirm] OCR missed, clicking confirm position")
@@ -498,11 +507,12 @@ class WarehouseTransferTask(BaseEfTask):
             h, w = frame.shape[:2]
             self._save_switch_debug("close_modal", frame,
                                     dot=(int(0.858 * w), int(0.186 * h)))
+        # SINGLE click only. The Backpack panel's own X close button sits at
+        # the SAME position (measured 0.87, 0.184 on r0_cell_0_0.png) once
+        # the modal is gone - a blind second click closed the entire depot
+        # UI, which broke Quick Stash and everything after (2026-08-13 log).
         self.click_relative(0.858, 0.186)
         self.sleep(0.8)
-        # Click again in case first click missed
-        self.click_relative(0.858, 0.186)
-        self.sleep(0.5)
 
     # Grid layout constants (relative to full 3840x2160 game frame).
     # Initial estimates - refined at runtime by _measure_grid_from_contours().
@@ -966,34 +976,43 @@ class WarehouseTransferTask(BaseEfTask):
 
             store_text = self.lang.WarehouseTransferTask.k_d661f6da
             self.log_info(f"[store] clicking Quick Stash")
-            # Try Tesseract to verify Quick Stash button is visible
+            # Quick Stash pill measured on r0_cell_0_0.png (4K): x 0.632-0.739,
+            # y 0.699-0.738. Tesseract on the padded box reads 'Quick Stash'
+            # on 12/12 sampled grid frames. Matches original upstream box
+            # (0.64, 0.705, 0.69, 0.735) - NOT bottom-right (0.87, 0.90).
             self.next_frame()
             frame = self.executor.frame
             store_found = False
             if frame is not None:
                 h, w = frame.shape[:2]
-                store_box = (int(w * 0.78), int(h * 0.84), int(w * 0.97), int(h * 0.97))
+                store_box = (int(w * 0.625), int(h * 0.695), int(w * 0.75), int(h * 0.745))
+                text = ocr_text(frame, box=store_box, psm=7)
+                self._save_switch_debug(
+                    "quick_stash", frame,
+                    boxes=[(store_box, f"Tess: '{text}'")],
+                    dot=(int(0.67 * w), int(0.718 * h)))
                 if ocr_match(frame, store_box, store_text):
                     self.log_info("[store] Tesseract confirmed Quick Stash visible")
                     store_found = True
 
-            if not store_found:
+            if store_found:
+                self.click_relative(0.67, 0.718)
+            else:
                 # Try framework OCR
                 store_btn = self.wait_ocr(
-                    box=self.box_of_screen(0.78, 0.84, 0.97, 0.97, name="onekey_store_area"),
+                    box=self.box_of_screen(0.625, 0.695, 0.75, 0.745, name="onekey_store_area"),
                     match=store_text,
                     time_out=2,
                     raise_if_not_found=False,
                 )
                 if store_btn:
+                    self.log_info("[store] framework OCR found, clicking")
                     self.click(store_btn[0])
-                    store_found = True
-
-            if not store_found:
-                self.log_info("[store] OCR missed, using positional click")
-            # Click Quick Stash position regardless (confirmed visible or positional)
-            self.click_relative(0.87, 0.90)
-            self._maybe_click_confirm()
+                else:
+                    self.log_info("[store] OCR missed, using positional click")
+                    self.click_relative(0.67, 0.718)
+            # Quick Stash usually has NO confirm dialog - never blind-click
+            self._maybe_click_confirm(positional_fallback=False)
             max_times -= 1
             if max_times <= 0:
                 break
