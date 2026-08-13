@@ -719,6 +719,69 @@ class WarehouseTransferTask(BaseEfTask):
         return title_text, desc_text
 
     @staticmethod
+    def _count_ocr_cell(frame, cx_px: int, cy_px: int, half_cw: int, half_ch: int) -> str:
+        """OCR the item-count text of one grid cell from a clean (no-tooltip) frame.
+
+        The count sits in a fixed band above the rarity bar: rows
+        [y_bot-62, y_bot-13] relative to cell bottom (measured at 4K). White
+        digits (val>170, sat<60) are isolated via HSV mask, then icon-highlight
+        noise is removed with connected components: digit glyphs are 15-45px
+        tall with bottoms on a shared baseline; period glyphs are 3-12px
+        squares sitting on the same baseline. The kept components are rendered
+        as a clean binary, upscaled 3x and padded 30px (Tesseract drops
+        periods/digits with less padding).
+
+        psm 7 is primary; when its output length disagrees with the kept
+        component count (each component = one glyph) psm 8 is tried - psm 7
+        returns '' on lone digits ('8') and truncates '27'->'2', while psm 8
+        alone hallucinates digits on K-values ('12K'->'412K').
+        Verified on all 96 cells of rounds r0-r2 (zero empties, all periods).
+        """
+        whitelist = "-c tessedit_char_whitelist=0123456789.KM"
+        y_bot = cy_px + half_ch
+        band = frame[max(0, y_bot - 62):y_bot - 13, max(0, cx_px - half_cw):cx_px + half_cw]
+        if band.size == 0:
+            return ""
+        hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+        mask = ((hsv[:, :, 2] > 170) & (hsv[:, :, 1] < 60)).astype(np.uint8)
+        if mask.sum() < 30:
+            return ""
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        bh = band.shape[0]
+        cand = [i for i in range(1, n)
+                if 15 <= stats[i][3] <= 45 and stats[i][1] + stats[i][3] >= bh - 18]
+        if not cand:
+            return ""
+        baseline = int(np.median([stats[i][1] + stats[i][3] for i in cand]))
+        keep = []
+        for i in range(1, n):
+            x, y, w_, h_, area = stats[i]
+            if abs((y + h_) - baseline) > 6:
+                continue
+            if 15 <= h_ <= 45:
+                keep.append(i)  # digit / K / M
+            elif 3 <= h_ <= 12 and 3 <= w_ <= 12 and area >= 6:
+                keep.append(i)  # decimal period on the baseline
+        if not keep:
+            return ""
+        km = np.isin(labels, keep)
+        rows = np.where(km.sum(axis=1) > 0)[0]
+        cols = np.where(km.sum(axis=0) > 0)[0]
+        t = max(0, rows[0] - 3)
+        b = min(bh, rows[-1] + 4)
+        l = max(0, cols[0] - 4)
+        r = min(band.shape[1], cols[-1] + 5)
+        binimg = np.where(km[t:b, l:r], 0, 255).astype(np.uint8)
+        up = cv2.resize(binimg, None, fx=3, fy=3, interpolation=cv2.INTER_NEAREST)
+        up = cv2.copyMakeBorder(up, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
+        txt = ocr_text(up, psm=7, extra_config=whitelist).strip().rstrip(".")
+        if len(txt) != len(keep):
+            txt8 = ocr_text(up, psm=8, extra_config=whitelist).strip().rstrip(".")
+            if len(txt8) == len(keep) or not txt:
+                txt = txt8
+        return txt
+
+    @staticmethod
     def _parse_count(text: str) -> int:
         """Parse item count from OCR text like '23', '80K', '7.74K', '1.2M'."""
         if not text:
@@ -822,12 +885,7 @@ class WarehouseTransferTask(BaseEfTask):
                 row_counts = {}
                 if clean_frame is not None:
                     for col, cx_px, cy_px, _, _ in row_captures:
-                        cnt_x1 = max(0, cx_px - half_cw)
-                        cnt_x2 = cx_px + half_cw
-                        cnt_y1 = cy_px + half_ch - 55
-                        cnt_y2 = min(h, cy_px + half_ch + 5)
-                        count_str = ocr_text(clean_frame, box=(cnt_x1, cnt_y1, cnt_x2, cnt_y2), psm=7)
-                        count_str = count_str.strip().split('\n')[0].strip()
+                        count_str = self._count_ocr_cell(clean_frame, cx_px, cy_px, half_cw, half_ch)
                         row_counts[col] = self._parse_count(count_str)
 
                 # Phase 4: OCR tooltips for item names

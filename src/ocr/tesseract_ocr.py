@@ -254,7 +254,7 @@ def ocr_frame(frame: np.ndarray, box=None, psm: int = 6) -> list[dict]:
 _ocr_diag = {"calls": 0, "errors": [], "last_error": ""}
 
 
-def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
+def ocr_text(frame: np.ndarray, box=None, psm: int = 6, extra_config: str = "") -> str:
     """
     Run Tesseract OCR and return combined text string.
 
@@ -262,6 +262,7 @@ def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
         frame: BGR or RGB numpy array
         box: Optional (x1, y1, x2, y2) pixel coordinates to crop
         psm: Page segmentation mode
+        extra_config: Extra tesseract config appended after --psm (e.g. char whitelist)
 
     Returns:
         Combined text string from all detections, or "" on any error
@@ -294,7 +295,7 @@ def ocr_text(frame: np.ndarray, box=None, psm: int = 6) -> str:
             return ""
 
         _ocr_diag["calls"] += 1
-        result = pytesseract.image_to_string(img_np, config=f'--psm {psm}').strip()
+        result = pytesseract.image_to_string(img_np, config=f'--psm {psm} {extra_config}'.strip()).strip()
         return result
     except Exception as e:
         err_msg = f"{type(e).__name__}: {e}"
