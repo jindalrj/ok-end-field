@@ -1,18 +1,23 @@
 import json
 import os
+import re
 from pathlib import Path
 
 import cv2
 import numpy as np
 import win32api
 import win32con
+import win32gui
 from qfluentwidgets import FluentIcon
 
+from ok.feature.Box import Box
 from src.data.world_map import item_to_warehouse_dict
 from src.data.zh_en import ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH, ITEM_TRANSLATION_DICT, ITEM_GAME_ENGLISH
 from src.core.BaseEfTask import BaseEfTask
 from src.icons import Icons
-from src.ocr import ocr_text, ocr_match, ensure_tesseract
+from src.ocr import ocr_text, ocr_match, ocr_frame, ensure_tesseract
+from src.ocr.tesseract_ocr import _initialized as _tess_initialized, _ocr_diag
+from src.tasks.onetime.item_matcher import matches as item_matches
 
 # Maps Chinese item name -> template image filename (without .png) in assets/items/images/
 _ITEM_TEMPLATE_DIR = Path(__file__).resolve().parents[3] / "assets" / "items" / "images"
@@ -276,7 +281,6 @@ class WarehouseTransferTask(BaseEfTask):
         self.next_frame()
         frame = self.executor.frame
         if frame is not None:
-            from src.ocr import ocr_frame
             h, w = frame.shape[:2]
             modal_box = (int(w * 0.15), int(h * 0.08), int(w * 0.55), int(h * 0.30))
             detections = ocr_frame(frame, box=modal_box, psm=6)
@@ -365,18 +369,11 @@ class WarehouseTransferTask(BaseEfTask):
     _GRID_ROWS = 4  # visible rows before scrolling
 
     def _hover_absolute(self, px_x: int, px_y: int):
-        """Move the real cursor AND send WM_MOUSEMOVE to trigger game tooltip.
-
-        Uses SetCursorPos for physical cursor + PostMessage WM_MOUSEMOVE
-        so the game processes the hover event (needed for tooltip popup).
-        """
-        import win32gui
-        # Activate window and move real cursor
+        """Move the real cursor AND send WM_MOUSEMOVE to trigger game tooltip."""
         interaction = self.executor.interaction
         interaction.try_activate()
         abs_x, abs_y = interaction.capture.get_abs_cords(px_x, px_y)
         win32api.SetCursorPos((abs_x, abs_y))
-        # Also send WM_MOUSEMOVE to the game window so it processes the hover
         lParam = win32api.MAKELONG(px_x, px_y)
         win32gui.PostMessage(interaction.hwnd, win32con.WM_MOUSEMOVE, 0, lParam)
 
@@ -387,27 +384,20 @@ class WarehouseTransferTask(BaseEfTask):
             px_x, px_y: cursor position (client coords)
             delta: wheel delta (negative = scroll down). 120 = 1 standard notch.
         """
-        import win32gui
-        import ctypes
-        WM_MOUSEWHEEL = 0x020A
         interaction = self.executor.interaction
         interaction.try_activate()
-        # Position cursor first
         abs_x, abs_y = interaction.capture.get_abs_cords(px_x, px_y)
         win32api.SetCursorPos((abs_x, abs_y))
-        # WM_MOUSEWHEEL: wParam = MAKEWPARAM(keystate, delta), lParam = MAKELPARAM(screen_x, screen_y)
-        wParam = (delta & 0xFFFF) << 16  # high word = delta (signed, stored as unsigned 16-bit)
-        lParam = win32api.MAKELONG(abs_x, abs_y)  # screen coords for WM_MOUSEWHEEL
-        win32gui.PostMessage(interaction.hwnd, WM_MOUSEWHEEL, wParam, lParam)
+        wParam = (delta & 0xFFFF) << 16
+        lParam = win32api.MAKELONG(abs_x, abs_y)
+        win32gui.PostMessage(interaction.hwnd, 0x020A, wParam, lParam)
 
     @staticmethod
     def _parse_count(text: str) -> int:
         """Parse item count from OCR text like '23', '80K', '7.74K', '1.2M'."""
-        import re
         if not text:
             return 0
         text = text.strip().upper().replace(',', '').replace(' ', '')
-        # Remove any non-numeric/KM characters
         text = re.sub(r'[^0-9.KM]', '', text)
         if not text:
             return 0
@@ -421,188 +411,102 @@ class WarehouseTransferTask(BaseEfTask):
         except (ValueError, IndexError):
             return 0
 
-    @staticmethod
-    def _fuzzy_match(ocr_text: str, target: str) -> bool:
-        """Check if OCR text matches target, tolerating common Tesseract errors.
-
-        For simple items: fuzzy match title against target (ratio >= 0.82).
-        For parenthetical items like "Hetonite Bottle (Clean Water)":
-          - Decompose target into base ("Hetonite Bottle") and fill ("Clean Water")
-          - Match title band against base
-          - Match description band (with "Filled with " prefix stripped) against fill
-        For short items (LC/SC/HC batteries): require exact prefix match on the
-        capitalized abbreviation to avoid LC matching SC.
-        """
-        if not ocr_text or not target:
-            return False
-        import re
-        from difflib import SequenceMatcher
-
-        # Exact full-string substring match - but skip if target has special
-        # delimiters that require structured matching (parens, brackets)
-        has_structured = '(' in target or '[' in target
-        if not has_structured and (target in ocr_text or ocr_text in target):
-            return True
-
-        # Clean OCR text
-        clean = re.sub(r'[^a-z0-9\s\'\-\[\]|]', '', ocr_text).strip()
-        # Split on | separator (title | description from band OCR)
-        parts = [p.strip() for p in clean.split('|')]
-        title_part = parts[0]
-        desc_part = parts[1] if len(parts) > 1 else ""
-
-        # Strip "filled with " prefix from description (game shows "Filled with Clean Water")
-        desc_content = re.sub(r'^filled with\s+', '', desc_part, flags=re.IGNORECASE).strip()
-
-        # For parenthetical targets: decompose and match parts separately.
-        # Must check BEFORE simple substring match to avoid "hetonite bottle" matching
-        # "hetonite bottle (clean water)" when the fill doesn't match.
-        if '(' in target:
-            paren_match = re.match(r'^(.+?)\s*\((.+?)\)$', target)
-            if paren_match:
-                target_base = paren_match.group(1).strip()
-                target_fill = paren_match.group(2).strip()
-                base_ratio = SequenceMatcher(None, title_part, target_base).ratio()
-                # Only proceed if title matches the base name
-                if base_ratio >= 0.82:
-                    # Must have description to confirm the fill content
-                    if desc_content:
-                        fill_ratio = SequenceMatcher(None, desc_content, target_fill).ratio()
-                        return fill_ratio >= 0.80
-                    # No description available - base match alone is not enough
-                    # for filled containers (would confuse empty vs filled)
-                    return False
-                return False
-
-        # Short items with uppercase prefixes (LC/SC/HC) - require exact prefix
-        short_prefix_match = re.match(r'^([A-Z]{2})\s+', target.strip(), re.IGNORECASE)
-        if short_prefix_match:
-            target_prefix = short_prefix_match.group(1).lower()
-            title_prefix_match = re.match(r'^([a-z]{2})\s+', title_part)
-            if title_prefix_match:
-                if title_prefix_match.group(1) != target_prefix:
-                    return False
-            # Check the rest with fuzzy
-            ratio = SequenceMatcher(None, title_part, target).ratio()
-            return ratio >= 0.85
-
-        # For bracket items like "Buck Capsule [A]" - require exact bracket content
-        bracket_match = re.match(r'^(.+?)\s*\[(.+?)\]$', target)
-        if bracket_match:
-            target_base = bracket_match.group(1).strip()
-            target_grade = bracket_match.group(2).strip()
-            # Must find exact bracket content in OCR
-            title_bracket = re.search(r'\[(.+?)\]', title_part)
-            if title_bracket:
-                if title_bracket.group(1).strip().lower() != target_grade.lower():
-                    return False
-                title_base = re.sub(r'\s*\[.+?\]', '', title_part).strip()
-                return SequenceMatcher(None, title_base, target_base).ratio() >= 0.82
-            # No bracket in OCR - fuzzy match full string
-            return SequenceMatcher(None, title_part, target).ratio() >= 0.85
-
-        # Substring match (safe here - no parens/brackets in target)
-        if target in title_part or title_part in target:
-            return True
-
-        # Standard fuzzy match for non-parenthetical items
-        ratio = SequenceMatcher(None, title_part, target).ratio()
-        return ratio >= 0.82
-
-    def _scan_grid_for_item(self, item_key_zh: str):
-        """
-        Scan the item grid by hovering each cell and reading the tooltip via OCR.
-
-        Moves left-to-right, top-to-bottom. After scanning all visible rows,
-        scrolls down and repeats. Returns last (bottom-right) match found.
-
-        Args:
-            item_key_zh: Item identifier (Chinese name OR English game name)
-
-        Returns a Box-like object at the item center, or None.
-        """
-        from ok.feature.Box import Box
-
-        # Build match targets from all available name forms
-        targets = [item_key_zh.lower()]
-        game_en = ITEM_GAME_ENGLISH.get(item_key_zh, "")
+    def _build_match_targets(self, item_key: str) -> list[str]:
+        """Build list of lowercase target strings to match against OCR output."""
+        targets = [item_key.lower()]
+        game_en = ITEM_GAME_ENGLISH.get(item_key, "")
         if game_en:
             targets.append(game_en.lower())
-        en_code = ITEM_TRANSLATION_DICT.get(item_key_zh, "")
+        en_code = ITEM_TRANSLATION_DICT.get(item_key, "")
         if en_code:
             targets.append(en_code.replace("_", " ").lower())
-        # If input was already an English name, add it directly
-        if item_key_zh.lower() not in [t for t in targets]:
-            pass  # already included
-        # Also check if input matches a game English name (user typed English)
-        _en_to_zh = {v.lower(): k for k, v in ITEM_GAME_ENGLISH.items()}
-        if item_key_zh.lower() in _en_to_zh:
-            zh_key = _en_to_zh[item_key_zh.lower()]
+        en_to_zh = {v.lower(): k for k, v in ITEM_GAME_ENGLISH.items()}
+        if item_key.lower() in en_to_zh:
+            zh_key = en_to_zh[item_key.lower()]
             targets.append(zh_key)
             code = ITEM_TRANSLATION_DICT.get(zh_key, "")
             if code:
                 targets.append(code.replace("_", " ").lower())
+        return targets
 
+    def _ocr_cell(self, frame: np.ndarray, cx_px: int, cy_px: int,
+                  col_width: float, row_height: float, w: int, h: int,
+                  tx1: int, ty1: int, tx2: int, ty2: int) -> tuple[str, str, int]:
+        """OCR a single cell. Returns (title, description, count)."""
+        half_cw = int(col_width * w / 2)
+        half_ch = int(row_height * h / 2)
+
+        # Count from bottom-left of cell
+        cnt_x1 = max(0, cx_px - half_cw)
+        cnt_x2 = cx_px - 10
+        cnt_y1 = cy_px + half_ch - 45
+        cnt_y2 = min(h, cy_px + half_ch + 5)
+        count_str = ocr_text(frame, box=(cnt_x1, cnt_y1, cnt_x2, cnt_y2), psm=7)
+        count_str = count_str.strip().split('\n')[0].strip()
+        item_count = self._parse_count(count_str)
+
+        # 3-band tooltip split
+        crop_h = ty2 - ty1
+        band1_end = int(crop_h * 0.33)
+        band2_end = int(crop_h * 0.58)
+        title_text = ocr_text(frame, box=(tx1, ty1, tx2, ty1 + band1_end), psm=7)
+        title_text = title_text.strip().split('\n')[0].strip()
+
+        desc_text = ""
+        if title_text:
+            desc_text = ocr_text(frame, box=(tx1, ty1 + band2_end, tx2, ty2), psm=7)
+            desc_text = desc_text.strip().split('\n')[0].strip()
+
+        return title_text, desc_text, item_count
+
+    def _scan_grid_for_item(self, item_key: str):
+        """Scan item grid by hovering each cell, reading tooltip via OCR.
+
+        Returns a Box at the bottom-right-most match, or None.
+        """
+        targets = self._build_match_targets(item_key)
         w, h = self.width, self.height
         col_width = (self._GRID_RIGHT - self._GRID_LEFT) / self._GRID_COLS
         row_height = (self._GRID_BOTTOM - self._GRID_TOP) / self._GRID_ROWS
+        half_cw = int(col_width * w / 2)
+        half_ch = int(row_height * h / 2)
 
         seen_items = set()
         last_top_left_text = None
-        last_match = None       # prefer bottom-right match
+        last_match = None
         last_match_count = 0
-        MAX_SCROLL_ROUNDS = 8
 
-        self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}, "
-                      f"cell_size=({col_width:.3f}, {row_height:.3f})")
+        self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}")
+        if not _tess_initialized:
+            self.log_info("[grid_scan] WARNING: tesseract not initialized!")
 
-        # Verify OCR is functional with a direct test
-        from src.ocr.tesseract_ocr import _initialized as tess_ok
-        if not tess_ok:
-            self.log_info("[grid_scan] WARNING: tesseract _initialized=False, OCR will return empty!")
-        else:
-            import pytesseract
-            self.log_info(f"[grid_scan] tesseract cmd={pytesseract.pytesseract.tesseract_cmd}")
-
-        # Debug screenshot directory
         debug_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "grid_scan_debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
-        self.log_info(f"[grid_scan] debug screenshots -> {debug_dir}")
 
-        for scroll_round in range(MAX_SCROLL_ROUNDS):
-            self.log_info(f"[grid_scan] --- scroll round {scroll_round} ---")
+        for scroll_round in range(8):
+            self.log_info(f"[grid_scan] --- round {scroll_round} ---")
             top_left_text = None
 
             for row in range(self._GRID_ROWS):
-                # Phase 1: Hover each cell and capture frames (no OCR yet, smooth movement)
-                row_captures = []  # list of (col, cx_px, cy_px, frame, tooltip_box)
+                # Phase 1: Hover and capture
+                row_captures = []
                 for col in range(self._GRID_COLS):
-                    cx_rel = self._GRID_LEFT + col_width * (col + 0.5)
-                    cy_rel = self._GRID_TOP + row_height * (row + 0.5)
-                    cx_px = int(cx_rel * w)
-                    cy_px = int(cy_rel * h)
-
+                    cx_px = int((self._GRID_LEFT + col_width * (col + 0.5)) * w)
+                    cy_px = int((self._GRID_TOP + row_height * (row + 0.5)) * h)
                     self._hover_absolute(cx_px, cy_px)
-                    self.sleep(0.65)  # wait for tooltip to appear
-
+                    self.sleep(0.65)
                     self.next_frame()
                     frame = self.executor.frame
                     if frame is None:
                         continue
+                    tx1 = min(w, cx_px + 48)
+                    tx2 = min(w, cx_px + 700)
+                    ty1 = max(0, cy_px + 15)
+                    ty2 = min(h, cy_px + 225)
+                    row_captures.append((col, cx_px, cy_px, frame.copy(), (tx1, ty1, tx2, ty2)))
 
-                    # Tooltip appears BELOW and to the RIGHT of the cursor.
-                    # Taller region captures subtitle lines like "Filled with Xircon Effluent".
-                    tooltip_x1 = min(w, int(cx_px + 48))
-                    tooltip_x2 = min(w, int(cx_px + 700))
-                    tooltip_y1 = max(0, int(cy_px + 15))
-                    tooltip_y2 = min(h, int(cy_px + 225))
-
-                    row_captures.append((col, cx_px, cy_px, frame.copy(),
-                                         (tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2)))
-
-                # Phase 2: OCR all captured frames (blocking calls happen here, cursor idle)
+                # Phase 2: OCR batch
                 for col, cx_px, cy_px, frame, (tx1, ty1, tx2, ty2) in row_captures:
-                    # Save debug screenshots for ALL rounds
                     try:
                         debug_frame = frame.copy()
                         cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (0, 255, 0), 3)
@@ -611,84 +515,54 @@ class WarehouseTransferTask(BaseEfTask):
                         crop = frame[ty1:ty2, tx1:tx2]
                         if crop.size > 0:
                             cv2.imwrite(str(debug_dir / f"r{scroll_round}_tooltip_{row}_{col}.png"), crop)
-                    except Exception as e:
-                        self.log_info(f"[grid_scan] screenshot save failed: {e}")
+                    except Exception:
+                        pass
 
-                    # OCR item count from bottom-left of cell (doesn't overlap tooltip)
-                    half_cw = int(col_width * w / 2)
-                    half_ch = int(row_height * h / 2)
-                    cnt_x1 = max(0, cx_px - half_cw)
-                    cnt_x2 = cx_px - 10
-                    cnt_y1 = cy_px + half_ch - 45
-                    cnt_y2 = min(h, cy_px + half_ch + 5)
-                    count_str = ocr_text(frame, box=(cnt_x1, cnt_y1, cnt_x2, cnt_y2), psm=7)
-                    count_str = count_str.strip().split('\n')[0].strip()
-                    item_count = self._parse_count(count_str)
+                    title_text, desc_text, item_count = self._ocr_cell(
+                        frame, cx_px, cy_px, col_width, row_height, w, h, tx1, ty1, tx2, ty2)
 
-                    # Split tooltip into 3 vertical bands to avoid mixing lines.
-                    crop_h = ty2 - ty1
-                    band1_end = int(crop_h * 0.33)    # title ends at ~33%
-                    band2_end = int(crop_h * 0.58)    # category ends at ~58%
-                    title_text = ocr_text(frame, box=(tx1, ty1, tx2, ty1 + band1_end), psm=7)
-                    title_text = title_text.strip().split('\n')[0].strip()  # first line only
+                    if not title_text:
+                        if col == 0 and scroll_round == 0:
+                            self.log_info(f"[grid_scan] ({row},{col}) empty! diag={_ocr_diag}")
+                        continue
 
-                    if not title_text and col == 0 and scroll_round == 0:
-                        from src.ocr.tesseract_ocr import _initialized, _ocr_diag
-                        self.log_info(f"[grid_scan] ({row},{col}) empty! _initialized={_initialized}, "
-                                      f"box=({tx1},{ty1},{tx2},{ty2}), shape={frame.shape}, "
-                                      f"diag={_ocr_diag}")
+                    full_text = title_text if not desc_text else f"{title_text} | {desc_text}"
+                    count_label = f" x{item_count}" if item_count else ""
+                    self.log_info(f"[grid_scan] ({row},{col}) -> '{full_text}'{count_label}")
+                    seen_items.add(title_text.lower())
 
-                    if title_text:
-                        # Also OCR the description band (line 3) for subtitle matching
-                        desc_text = ocr_text(frame, box=(tx1, ty1 + band2_end, tx2, ty2), psm=7)
-                        desc_text = desc_text.strip().split('\n')[0].strip()
-                        full_text = title_text if not desc_text else f"{title_text} | {desc_text}"
-                        count_label = f" x{item_count}" if item_count else ""
+                    if row == 0 and col == 0 and top_left_text is None:
+                        top_left_text = title_text
 
-                        self.log_info(f"[grid_scan] ({row},{col}) -> '{full_text}'{count_label}")
-                        seen_items.add(title_text.lower())
+                    match_text = full_text.lower()
+                    for target in targets:
+                        if item_matches(match_text, target):
+                            last_match = Box(cx_px - half_cw, cy_px - half_ch,
+                                             int(col_width * w), int(row_height * h), name=title_text)
+                            last_match_count = item_count
+                            self.log_info(f"[grid_scan] MATCH '{target}' at ({row},{col}){count_label}")
+                            break
 
-                        if row == 0 and col == 0 and top_left_text is None:
-                            top_left_text = title_text
-
-                        # Track matches but prefer bottom-right (last match in grid)
-                        match_text = full_text.lower()
-                        for target in targets:
-                            if self._fuzzy_match(match_text, target):
-                                last_match = Box(cx_px - half_cw, cy_px - half_ch,
-                                                 int(col_width * w), int(row_height * h), name=title_text)
-                                last_match_count = item_count
-                                self.log_info(f"[grid_scan] MATCH '{target}' in '{full_text}' at ({row},{col}){count_label}")
-                                break
-                    else:
-                        self.log_info(f"[grid_scan] ({row},{col}) empty")
-
-            # If we found a match in this round, return the last (bottom-right) one
             if last_match:
-                self.log_info(f"[grid_scan] returning bottom-right match: '{last_match.name}' x{last_match_count}")
+                self.log_info(f"[grid_scan] returning: '{last_match.name}' x{last_match_count}")
                 return last_match
 
-            # Check if we've hit the bottom (top-left same as previous round means
-            # scroll had no effect - we're at the end of the list)
             if top_left_text and top_left_text == last_top_left_text:
-                self.log_info(f"[grid_scan] top-left unchanged ('{top_left_text}'), no more items")
+                self.log_info(f"[grid_scan] end of list (top-left unchanged: '{top_left_text}')")
                 break
             last_top_left_text = top_left_text
 
-            # Scroll down using precise WM_MOUSEWHEEL delta.
-            # Measured: delta 216 = exactly 4 rows (0 overlap). Increase to 240
-            # for ~4.4 rows advancement, giving slight overlap to prevent drift.
+            # Scroll down ~4 rows
             scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
             scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
             self._hover_absolute(scroll_x, scroll_y)
             self.sleep(0.2)
             self._scroll_precise(scroll_x, scroll_y, -240)
             self.sleep(1.2)
-            # Discard stale frame so next_frame() returns fresh content
             self.next_frame()
             self.sleep(0.3)
 
-        self.log_info(f"[grid_scan] targets {targets} NOT found. Seen: {sorted(seen_items)}")
+        self.log_info(f"[grid_scan] NOT found. Seen: {sorted(seen_items)}")
         return None
 
     def _ctrl_click(self, box):
