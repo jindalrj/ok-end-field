@@ -15,7 +15,7 @@ from src.data.world_map import item_to_warehouse_dict
 from src.data.zh_en import ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH, ITEM_TRANSLATION_DICT, ITEM_GAME_ENGLISH
 from src.core.BaseEfTask import BaseEfTask
 from src.icons import Icons
-from src.ocr import ocr_text, ocr_match, ocr_frame, ensure_tesseract
+from src.ocr import ocr_text, ocr_match, ensure_tesseract
 from src.ocr import tesseract_ocr as _tess_mod
 from src.ocr.tesseract_ocr import _ocr_diag
 from src.tasks.onetime.item_matcher import matches as item_matches
@@ -179,12 +179,33 @@ class WarehouseTransferTask(BaseEfTask):
         detect_map = _LOCATION_DETECT.get(locale, _LOCATION_DETECT["zh_CN"])
         frame = self.executor.frame
 
+        debug_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "grid_scan_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
         # Primary: Tesseract OCR on the title region
         if frame is not None:
             h, w = frame.shape[:2]
-            # Title area: "Valley IV Depot" / "武陵仓库" at ~(0.10, 0.17) to (0.29, 0.23)
-            title_box = (int(w * 0.10), int(h * 0.17), int(w * 0.29), int(h * 0.23))
-            text = ocr_text(frame, box=title_box, psm=6)
+            # Title area: "Valley IV Depot" / "武陵仓库". Measured on 4K frames:
+            # title text rows y=0.190-0.217; decorative barcode glyphs sit at
+            # y=0.173-0.182 and OCR as garbage ('479', '|', 'ill') if included,
+            # so the top bound must be > 0.182. Icon box ends x<0.145.
+            title_box = (int(w * 0.145), int(h * 0.187), int(w * 0.29), int(h * 0.219))
+            text = ocr_text(frame, box=title_box, psm=7)
+
+            # Debug: save annotated screenshot
+            try:
+                debug_frame = frame.copy()
+                bx1, by1, bx2, by2 = title_box
+                cv2.rectangle(debug_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 3)
+                label = f"Tess: '{text}'" if text else "Tess: (empty)"
+                cv2.putText(debug_frame, label, (bx1, by1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+                cv2.imwrite(str(debug_dir / "detect_location.png"), debug_frame)
+                # Save cropped title region
+                cv2.imwrite(str(debug_dir / "detect_location_crop.png"), frame[by1:by2, bx1:bx2])
+            except Exception:
+                pass
+
             if text:
                 self.log_info(f"[detect_location] Tesseract: '{text}'")
                 for loc_key, pattern in detect_map.items():
@@ -214,6 +235,39 @@ class WarehouseTransferTask(BaseEfTask):
                 return loc_key
         return None
 
+    # Confirm/Connected button in the Switch Depot modal. Measured on 4K
+    # frames: button pill spans (0.711-0.870, 0.779-0.836); its text
+    # ("Confirm" / "Connected") sits at (0.775-0.850, 0.792-0.825).
+    # A tight text-only box is required: including the dark surround makes
+    # Otsu binarize pill-vs-background and the text is lost.
+    _MODAL_BTN_TEXT_BOX = (0.775, 0.792, 0.850, 0.825)
+    _MODAL_BTN_CLICK = (0.79, 0.81)
+
+    @staticmethod
+    def _debug_dir() -> Path:
+        d = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "grid_scan_debug"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _save_switch_debug(self, name: str, frame, boxes=None, dot=None):
+        """Save an annotated debug screenshot.
+
+        boxes: list of ((x1, y1, x2, y2), label) in pixel coords.
+        dot: (x, y) pixel coords of the click that was performed.
+        """
+        try:
+            debug_frame = frame.copy()
+            for (bx1, by1, bx2, by2), label in (boxes or []):
+                cv2.rectangle(debug_frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 3)
+                if label:
+                    cv2.putText(debug_frame, label, (int(bx1), int(by1) - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+            if dot is not None:
+                cv2.circle(debug_frame, (int(dot[0]), int(dot[1])), 15, (0, 0, 255), -1)
+            cv2.imwrite(str(self._debug_dir() / f"{name}.png"), debug_frame)
+        except Exception:
+            pass
+
     def _maybe_click_confirm(self):
         """Click Confirm button if it appears (Tesseract primary, positional fallback)."""
         confirm_text = self.lang.WarehouseTransferTask.k_b56d9ac6
@@ -223,16 +277,22 @@ class WarehouseTransferTask(BaseEfTask):
         # Try Tesseract first
         if frame is not None:
             h, w = frame.shape[:2]
-            confirm_box = (int(w * 0.78), int(h * 0.84), int(w * 0.97), int(h * 0.97))
+            l, t, r, b = self._MODAL_BTN_TEXT_BOX
+            confirm_box = (int(w * l), int(h * t), int(w * r), int(h * b))
+            text = ocr_text(frame, box=confirm_box, psm=7)
+            click_px = (int(self._MODAL_BTN_CLICK[0] * w), int(self._MODAL_BTN_CLICK[1] * h))
+            self._save_switch_debug("confirm_btn", frame,
+                                    boxes=[(confirm_box, f"Tess: '{text}'")], dot=click_px)
+
             if ocr_match(frame, confirm_box, confirm_text):
-                self.log_info(f"[confirm] Tesseract found '{confirm_text}', clicking")
-                self.click_relative(0.88, 0.91)
+                self.log_info(f"[confirm] Tesseract found '{text}', clicking")
+                self.click_relative(*self._MODAL_BTN_CLICK)
                 self.sleep(0.5)
                 return True
 
         # Try framework OCR
         hits = self.wait_ocr(
-            box=self.box_of_screen(0.78, 0.84, 0.97, 0.97, name="confirm_btn_area"),
+            box=self.box_of_screen(0.70, 0.77, 0.88, 0.845, name="confirm_btn_area"),
             match=confirm_text,
             time_out=2,
             raise_if_not_found=False,
@@ -245,9 +305,68 @@ class WarehouseTransferTask(BaseEfTask):
 
         # Positional fallback
         self.log_info("[confirm] OCR missed, clicking confirm position")
-        self.click_relative(0.88, 0.91)
+        self.click_relative(*self._MODAL_BTN_CLICK)
         self.sleep(0.5)
         return True
+
+    def _find_depot_rows(self, frame) -> list[dict]:
+        """Locate depot option rows in the Switch Depot modal.
+
+        Rows are bright pills (val > 60) against the near-black modal
+        background within (0.45-0.70, 0.35-0.68). Row positions SHIFT
+        between modal states (measured: Wuling row at y 0.418 in the
+        initial state vs 0.504 once selected), so rows are detected
+        structurally instead of via fixed coordinates.
+
+        The name text ("Wuling" / "Valley IV") occupies the top ~60% of
+        each row, left of the Connected/Disconnected label. Its color
+        varies (dark-on-white when selected, grey-on-grey when disabled,
+        dark-on-teal when connected), so each name crop is Otsu-binarized
+        and polarity-normalized before OCR.
+
+        Returns list of {"text", "cx", "cy" (relative), "box" (pixel)}.
+        """
+        h, w = frame.shape[:2]
+        x1, x2 = int(w * 0.45), int(w * 0.70)
+        y1, y2 = int(h * 0.35), int(h * 0.68)
+        hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+        val = hsv[:, :, 2]
+        coverage = (val > 60).sum(axis=1) / (x2 - x1)
+        rows = np.where(coverage > 0.5)[0]
+        if len(rows) == 0:
+            return []
+
+        bands = []
+        start = rows[0]
+        for i in range(1, len(rows)):
+            if rows[i] - rows[i - 1] > 10:
+                bands.append((start, rows[i - 1]))
+                start = rows[i]
+        bands.append((start, rows[-1]))
+
+        results = []
+        for b_top, b_bot in bands:
+            if b_bot - b_top < 40:
+                continue
+            ny1 = y1 + b_top + 2
+            ny2 = y1 + b_top + int((b_bot - b_top) * 0.62)
+            nx1, nx2 = int(w * 0.455), int(w * 0.66)
+            crop = frame[ny1:ny2, nx1:nx2]
+            if crop.size == 0:
+                continue
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            if (binary == 0).mean() > 0.5:
+                binary = 255 - binary  # normalize to black text on white
+            padded = cv2.copyMakeBorder(binary, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+            text = ocr_text(padded, psm=7).strip()
+            results.append({
+                "text": text,
+                "cx": 0.575,
+                "cy": (2 * y1 + b_top + b_bot) / 2 / h,
+                "box": (nx1, ny1, nx2, ny2),
+            })
+        return results
 
     def _switch_location(self, target_key: str):
         locale = self._get_locale()
@@ -255,50 +374,65 @@ class WarehouseTransferTask(BaseEfTask):
         if target_key not in loc_names:
             raise ValueError(f"未知 location key: {target_key}")
 
-        # Step 1: Click the Switch Depot button (teal pill in depot header)
+        # Step 1: Click the Switch Depot button (white pill right of the
+        # depot title). Measured: pill (0.445-0.562, 0.166-0.208), text
+        # "Switch Depot" at (0.455-0.540, 0.180-0.210).
         switch_text = self.lang.WarehouseTransferTask.k_3cb6baa6
         self.log_info(f"[switch] clicking Switch Depot button, locale={locale}")
-        btn = self.wait_ocr(
-            box=self.box_of_screen(0.20, 0.03, 0.35, 0.10, name="switch_btn_area"),
-            match=switch_text,
-            time_out=2,
-            raise_if_not_found=False,
-        )
-        if btn:
-            self.click(btn[0])
-        else:
-            self.log_info("[switch] framework OCR missed, using positional click")
-            self.click_relative(0.26, 0.06)
+        clicked_btn = False
+        self.next_frame()
+        frame = self.executor.frame
+        if frame is not None:
+            h, w = frame.shape[:2]
+            btn_box = (int(w * 0.455), int(h * 0.180), int(w * 0.540), int(h * 0.210))
+            text = ocr_text(frame, box=btn_box, psm=7)
+            self._save_switch_debug("switch_btn", frame,
+                                    boxes=[(btn_box, f"Tess: '{text}'")],
+                                    dot=(int(0.50 * w), int(0.193 * h)))
+            if ocr_match(frame, btn_box, switch_text):
+                self.log_info(f"[switch] Tesseract found '{text}', clicking")
+                self.click_relative(0.50, 0.193)
+                clicked_btn = True
+        if not clicked_btn:
+            btn = self.wait_ocr(
+                box=self.box_of_screen(0.44, 0.16, 0.56, 0.21, name="switch_btn_area"),
+                match=switch_text,
+                time_out=2,
+                raise_if_not_found=False,
+            )
+            if btn:
+                self.click(btn[0])
+            else:
+                self.log_info("[switch] OCR missed, using positional click")
+                self.click_relative(0.50, 0.193)
         self.sleep(1.0)
 
-        # Step 2: Click the target depot in the modal
-        # Positions: Wuling ~(0.35, 0.14), Valley IV ~(0.35, 0.18)
-        _OPTION_POSITIONS = {"wuling": 0.14, "valley4": 0.18}
+        # Step 2: Click the target depot row in the modal
         target_text = loc_names[target_key]
         self.log_info(f"[switch] selecting depot '{target_text}'")
 
-        # Try Tesseract to find the target depot name in modal
         clicked_target = False
         self.next_frame()
         frame = self.executor.frame
         if frame is not None:
             h, w = frame.shape[:2]
-            modal_box = (int(w * 0.15), int(h * 0.08), int(w * 0.55), int(h * 0.30))
-            detections = ocr_frame(frame, box=modal_box, psm=6)
-            for det in detections:
-                if target_text.lower() in det["text"].lower():
-                    # Click center of detected text
-                    cx = det["x"] + det["w"] // 2
-                    cy = det["y"] + det["h"] // 2
-                    self.log_info(f"[switch] Tesseract found '{det['text']}' at ({cx},{cy})")
-                    self.click_relative(cx / w, cy / h)
-                    clicked_target = True
+            rows = self._find_depot_rows(frame)
+            dbg_boxes = [(r["box"], f"Tess: '{r['text']}'") for r in rows]
+            dot = None
+            for r in rows:
+                if target_text.lower() in r["text"].lower():
+                    self.log_info(f"[switch] Tesseract found '{r['text']}' at y={r['cy']:.3f}")
+                    dot = (int(r["cx"] * w), int(r["cy"] * h))
                     break
+            self._save_switch_debug("switch_modal", frame, boxes=dbg_boxes, dot=dot)
+            if dot is not None:
+                self.click_relative(dot[0] / w, dot[1] / h)
+                clicked_target = True
 
         if not clicked_target:
-            # Fallback: framework OCR
+            # Fallback: framework OCR over the modal options area
             option = self.wait_ocr(
-                box=self.box_of_screen(0.15, 0.08, 0.55, 0.30, name="switch_menu"),
+                box=self.box_of_screen(0.35, 0.35, 0.80, 0.68, name="switch_menu"),
                 match=target_text,
                 time_out=2,
                 raise_if_not_found=False,
@@ -308,15 +442,23 @@ class WarehouseTransferTask(BaseEfTask):
                 clicked_target = True
 
         if not clicked_target:
-            option_y = _OPTION_POSITIONS.get(target_key, 0.16)
+            # Positional fallback: rows in the initial (unselected) modal
+            # state sit at y=0.418 (Wuling) / 0.510 (Valley IV)
+            _OPTION_POSITIONS = {"wuling": 0.418, "valley4": 0.510}
+            option_y = _OPTION_POSITIONS.get(target_key, 0.418)
             self.log_info(f"[switch] OCR missed, positional click y={option_y}")
-            self.click_relative(0.35, option_y)
+            if frame is not None:
+                h, w = frame.shape[:2]
+                self._save_switch_debug("switch_modal_fallback", frame,
+                                        dot=(int(0.575 * w), int(option_y * h)))
+            self.click_relative(0.575, option_y)
         self.sleep(0.5)
 
         # Step 3: Click Confirm if it appears
         self._maybe_click_confirm()
 
-        # Step 4: Wait for "Connected" using Tesseract
+        # Step 4: Wait for "Connected" on the modal's bottom button (the
+        # yellow Confirm pill turns into a greyed "Connected" pill)
         connected_text = self.lang.WarehouseTransferTask.k_65fe35c4
         self.log_info(f"[switch] waiting for '{connected_text}'...")
         connected = False
@@ -325,14 +467,14 @@ class WarehouseTransferTask(BaseEfTask):
             frame = self.executor.frame
             if frame is not None:
                 h, w = frame.shape[:2]
-                # Connected button at bottom-right of modal ~(0.78, 0.84) to (0.97, 0.97)
-                conn_box = (int(w * 0.78), int(h * 0.84), int(w * 0.97), int(h * 0.97))
+                l, t, r, b = self._MODAL_BTN_TEXT_BOX
+                conn_box = (int(w * l), int(h * t), int(w * r), int(h * b))
                 if ocr_match(frame, conn_box, connected_text):
                     self.log_info(f"[switch] Tesseract detected '{connected_text}' after {i} polls")
                     connected = True
                     break
             # Also try framework OCR
-            hits = self.ocr(box=self.box_of_screen(0.78, 0.84, 0.97, 0.97), match=connected_text, threshold=0.1)
+            hits = self.ocr(box=self.box_of_screen(0.70, 0.77, 0.88, 0.845), match=connected_text, threshold=0.1)
             if hits:
                 self.log_info(f"[switch] framework OCR detected connected after {i} polls")
                 connected = True
@@ -350,11 +492,16 @@ class WarehouseTransferTask(BaseEfTask):
     def _close_switch_depot_modal(self):
         """Close the Switch Depot modal by clicking its X button."""
         self.log_info("[close_modal] clicking X button")
-        # X button at top-right of modal: ~(0.54, 0.06)
-        self.click_relative(0.54, 0.06)
+        # X button at top-right of modal: measured (0.858, 0.186)
+        frame = self.executor.frame
+        if frame is not None:
+            h, w = frame.shape[:2]
+            self._save_switch_debug("close_modal", frame,
+                                    dot=(int(0.858 * w), int(0.186 * h)))
+        self.click_relative(0.858, 0.186)
         self.sleep(0.8)
         # Click again in case first click missed
-        self.click_relative(0.54, 0.06)
+        self.click_relative(0.858, 0.186)
         self.sleep(0.5)
 
     # Grid layout constants (relative to full 3840x2160 game frame).
@@ -395,8 +542,8 @@ class WarehouseTransferTask(BaseEfTask):
     def _extract_tooltip_text(crop: np.ndarray) -> tuple[str, str]:
         """Detect tooltip panel via color, crop to text regions, OCR.
 
-        Uses HSV analysis to find the dark-grey tooltip panel, then isolates
-        white text within it. Skips description OCR if no text exists there.
+        Verified against 256 tooltip crops (8 rounds x 32 cells) from actual
+        4K gameplay screenshots: 0 missed titles, 8/8 container descs.
 
         Returns (title_text, desc_text).
         """
@@ -405,17 +552,32 @@ class WarehouseTransferTask(BaseEfTask):
             return "", ""
 
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        val = hsv[:, :, 2]
         sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
 
-        # Panel mask: dark grey, low saturation
-        panel_mask = (val > 25) & (val < 95) & (sat < 45)
+        # Panel mask: sat < 120 because high-rarity tooltips have an
+        # orange/tan tinted panel (measured sat_med 34-86, sat_p90 107)
+        # while the common grey panel is sat < 45. Background cells below
+        # the panel stay val > 95 so the val bound still excludes them.
+        panel_mask = (val > 25) & (val < 95) & (sat < 120)
         row_coverage = panel_mask.sum(axis=1) / w
 
-        # Find panel bottom: last row from top with >35% coverage (allow small gaps)
+        # Find panel rows: need >35% coverage
         panel_rows = np.where(row_coverage > 0.35)[0]
         if len(panel_rows) < 10:
-            return "", ""
+            # Fallback: try the top 33% band directly with Tesseract
+            band = crop[0:int(h * 0.33), :]
+            if band.size == 0:
+                return "", ""
+            gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+            inv = 255 - gray
+            _, binary = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            padded = cv2.copyMakeBorder(binary, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+            title_text = ocr_text(padded, psm=7)
+            title_text = title_text.strip().split('\n')[0].strip()
+            return title_text, ""
+
+        # Find contiguous panel block from first panel row
         panel_top = panel_rows[0]
         panel_bottom = panel_top
         for i in range(1, len(panel_rows)):
@@ -423,12 +585,20 @@ class WarehouseTransferTask(BaseEfTask):
                 break
             panel_bottom = panel_rows[i]
 
-        # Text mask: white pixels within panel
+        # Text mask: white pixels within panel region only
         text_mask = (val > 170) & (sat < 60)
+        text_mask[:panel_top, :] = False   # ignore above panel
         text_mask[panel_bottom:, :] = False  # ignore below panel
 
-        # Find text row clusters
-        text_row_counts = text_mask.sum(axis=1)
+        # Cluster on the LEFT 40% of columns only: bright item-icon
+        # highlights (bottles, metallic towers) to the right of the panel
+        # otherwise bridge row gaps and merge title/category/icon into one
+        # giant cluster. The title always starts in the left region; its
+        # full width is measured later against the full-width mask.
+        left_mask = text_mask.copy()
+        left_mask[:, int(w * 0.4):] = False
+
+        text_row_counts = left_mask.sum(axis=1)
         text_rows = np.where(text_row_counts > 5)[0]
         if len(text_rows) == 0:
             return "", ""
@@ -441,13 +611,29 @@ class WarehouseTransferTask(BaseEfTask):
                 cluster_start = text_rows[i]
         clusters.append((cluster_start, text_rows[-1]))
 
-        if not clusters:
+        # Title = first cluster that is tall enough (>=15px) and starts in
+        # the left 40% of the crop. Rejects spurious clusters from
+        # neighboring-cell count digits (short, right-aligned white blobs).
+        title_cluster = None
+        for c_top, c_bot in clusters:
+            if c_bot - c_top < 15:
+                continue
+            c_cols = np.where(text_mask[c_top:c_bot + 1, :].sum(axis=0) > 0)[0]
+            if len(c_cols) == 0 or c_cols[0] > w * 0.4:
+                continue
+            title_cluster = (c_top, c_bot)
+            break
+        if title_cluster is None:
             return "", ""
-
-        # Title = first cluster
-        title_top, title_bottom = clusters[0]
+        title_top, title_bottom = title_cluster
         title_top = max(0, title_top - 2)
-        title_bottom = min(h, title_bottom + 2)
+        # +12: g/y descenders extend 11-12px below the cluster end (cluster
+        # rows need >5px in the left 40%; descender-only rows have <=5px so
+        # the cluster stops at the baseline, which made Tesseract read
+        # 'Mining Rig' as 'Minina Ria'). Measured descender end 67-68 vs
+        # cluster end 56, category text starts >=79 (r0_tooltip_3_7,
+        # r4_tooltip_0_2, r5_tooltip_1_3).
+        title_bottom = min(h, title_bottom + 12)
 
         # Horizontal bounds with gap detection (excludes adjacent cell content)
         col_has_text = text_mask[title_top:title_bottom, :].sum(axis=0) > 0
@@ -473,24 +659,52 @@ class WarehouseTransferTask(BaseEfTask):
         title_padded = cv2.copyMakeBorder(title_bin, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
         title_text = ocr_text(title_padded, psm=7)
         title_text = title_text.strip().split('\n')[0].strip()
+        # Trailing Roman numerals: Tesseract reads 'I' as '|' and 'II' as
+        # 'Il' ('Aerospace Material Il', 'Marsh Gas Mk |'). A trailing word
+        # made only of I/l/| chars can only be a Roman numeral.
+        title_text = re.sub(
+            r' ([Il|]+)$', lambda m: ' ' + 'I' * len(m.group(1)), title_text)
 
-        # Description: 3rd+ text cluster (skip category which is 2nd)
+        # Description ("Filled with X") sits in a DARKER band below the
+        # panel (val_med ~18 vs panel ~37) with dim grey text (val ~115-160)
+        # that fails the val>170 title mask. Detect the dark band by
+        # val<30 row coverage and OCR it with a dim-text mask.
         desc_text = ""
-        if len(clusters) >= 3 and (panel_bottom - panel_top) > 100:
-            desc_top = max(0, clusters[2][0] - 2)
-            desc_bottom = min(panel_bottom, clusters[-1][1] + 2)
-            desc_col_mask = text_mask[desc_top:desc_bottom, :].sum(axis=0) > 0
-            desc_cols = np.where(desc_col_mask)[0]
-            if len(desc_cols) > 10:
-                dl = max(0, desc_cols[0] - 5)
-                dr = min(w, desc_cols[-1] + 5)
-                desc_crop = crop[desc_top:desc_bottom, dl:dr]
-                desc_gray = cv2.cvtColor(desc_crop, cv2.COLOR_BGR2GRAY)
-                desc_inv = 255 - desc_gray
-                _, desc_bin = cv2.threshold(desc_inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                desc_padded = cv2.copyMakeBorder(desc_bin, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
-                desc_text = ocr_text(desc_padded, psm=7)
-                desc_text = desc_text.strip().split('\n')[0].strip()
+        dark_cov = (val < 30).sum(axis=1) / w
+        band_top = None
+        band_bottom = None
+        for r in range(panel_bottom + 1, min(h, panel_bottom + 12)):
+            if dark_cov[r] > 0.4:
+                band_top = r
+                break
+        if band_top is not None:
+            band_bottom = band_top
+            for r in range(band_top + 1, h):
+                if dark_cov[r] > 0.4:
+                    band_bottom = r
+                else:
+                    break
+        if band_top is not None and band_bottom - band_top > 20:
+            dim_mask = (val > 110) & (sat < 60)
+            dim_mask[:band_top, :] = False
+            dim_mask[band_bottom + 1:, :] = False
+            dim_rows = np.where(dim_mask.sum(axis=1) > 5)[0]
+            if len(dim_rows) >= 8:
+                d_top = max(band_top, dim_rows[0] - 2)
+                d_bot = min(band_bottom, dim_rows[-1] + 2)
+                d_cols = np.where(dim_mask[d_top:d_bot + 1, :].sum(axis=0) > 0)[0]
+                if len(d_cols) > 10:
+                    dl = max(0, d_cols[0] - 5)
+                    dr = min(w, d_cols[-1] + 5)
+                    desc_crop = crop[d_top:d_bot + 1, dl:dr]
+                    desc_gray = cv2.cvtColor(desc_crop, cv2.COLOR_BGR2GRAY)
+                    desc_inv = 255 - desc_gray
+                    _, desc_bin = cv2.threshold(desc_inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    desc_padded = cv2.copyMakeBorder(desc_bin, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+                    desc_text = ocr_text(desc_padded, psm=7)
+                    desc_text = desc_text.strip().split('\n')[0].strip()
+                    if sum(ch.isalpha() for ch in desc_text) < 4:
+                        desc_text = ""
 
         return title_text, desc_text
 
@@ -587,6 +801,12 @@ class WarehouseTransferTask(BaseEfTask):
                 clean_frame = self.executor.frame
                 if clean_frame is None:
                     clean_frame = row_captures[-1][3] if row_captures else None
+
+                # Move cursor back to grid center (scroll requires cursor in grid area)
+                grid_cx = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
+                grid_cy = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
+                self._hover_absolute(grid_cx, grid_cy)
+                self.sleep(0.15)
 
                 # Phase 3: Read counts from clean frame (no tooltip overlay)
                 row_counts = {}

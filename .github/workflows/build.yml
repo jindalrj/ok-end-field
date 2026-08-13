@@ -112,13 +112,6 @@ jobs:
           $src = "C:\Program Files\Tesseract-OCR"
           $dst = Join-Path $pwd "tesseract"
           Copy-Item -Path $src -Destination $dst -Recurse -Force
-          # Replace stock eng.traineddata with our fine-tuned model
-          $customEng = Join-Path $pwd "assets" "tessdata" "eng.traineddata"
-          $targetEng = Join-Path $dst "tessdata" "eng.traineddata"
-          if (Test-Path $customEng) {
-            Copy-Item -Path $customEng -Destination $targetEng -Force
-            Write-Host "Replaced eng.traineddata with fine-tuned model ($([math]::Round((Get-Item $customEng).Length/1MB, 1)) MB)"
-          }
           Write-Host "Bundled Tesseract to $dst ($(Get-ChildItem $dst -Recurse -File | Measure-Object -Property Length -Sum | ForEach-Object { [math]::Round($_.Sum/1MB, 1) }) MB)"
 
       - name: Install dependencies

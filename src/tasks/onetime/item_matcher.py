@@ -100,10 +100,26 @@ def match_graded(title: str, base: str, grade: str) -> bool:
 
 
 def match_simple(title: str, target_name: str) -> bool:
-    """Match a simple item: substring or fuzzy (ratio >= 0.82)."""
+    """Match a simple item: substring or fuzzy (ratio >= 0.82).
+
+    Requires both title and target to be at least 3 chars to avoid
+    garbage matches like 'w' or '—' matching real item names.
+    """
+    if len(title) < 3 or len(target_name) < 3:
+        return False
     if target_name in title or title in target_name:
         return True
     return _ratio(title, target_name) >= 0.82
+
+
+def _is_garbage(text: str) -> bool:
+    """Return True if text is likely OCR garbage (symbols, single chars, etc.)."""
+    if len(text) < 3:
+        return True
+    alpha_count = sum(1 for c in text if c.isalpha())
+    if alpha_count < 2:
+        return True
+    return False
 
 
 def matches(ocr_text: str, target: str) -> bool:
@@ -119,6 +135,11 @@ def matches(ocr_text: str, target: str) -> bool:
         return False
 
     title, desc = parse_ocr_text(ocr_text)
+
+    # Reject garbage OCR output before attempting match
+    if _is_garbage(title):
+        return False
+
     item_type, components = classify_target(target)
 
     if item_type == ItemType.FILLED_CONTAINER:
