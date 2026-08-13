@@ -77,7 +77,8 @@ ITEM_GAME_ENGLISH = {
     "紫晶零件": "Amethyst Part",
     "赫铜零件": "Hetonite Part",
     "源晶零件": "Cryston Part",
-    "辉铜零件": "Pyrrolite Part",
+    "辉铜零件": "Cuprium Part",
+    "灼铜零件": "Pyrrolite Part",
     # Components
     "蓝铁组件": "Ferrium Component",
     "紫晶组件": "Amethyst Component",
@@ -91,6 +92,9 @@ ITEM_GAME_ENGLISH = {
     # Bottles (base containers)
     "赫铜瓶": "Hetonite Bottle",
     "源晶瓶": "Cryston Bottle",
+    "紫晶质瓶": "Amethyst Bottle",
+    "蓝铁瓶": "Ferrium Bottle",
+    "钢质瓶": "Steel Bottle",
     "辉铜罐": "Cuprium Canister",
     # Hetonite Bottle filled variants
     "赫铜瓶（净水）": "Hetonite Bottle (Clean Water)",
@@ -116,6 +120,21 @@ ITEM_GAME_ENGLISH = {
     "源晶瓶（惰性晶体流出物）": "Cryston Bottle (Inert Xircon Effluent)",
     "源晶瓶（辉铜溶液）": "Cryston Bottle (Cuprium Solution)",
     "源晶瓶（赫铜溶液）": "Cryston Bottle (Hetonite Solution)",
+    # Amethyst Bottle filled variants
+    "紫晶质瓶（锦草）": "Amethyst Bottle (Jincao)",
+    "紫晶质瓶（芽针）": "Amethyst Bottle (Yazhen)",
+    "紫晶质瓶（净水）": "Amethyst Bottle (Clean Water)",
+    "紫晶质瓶（液化息壤）": "Amethyst Bottle (Liquid Xiranite)",
+    # Ferrium Bottle filled variants
+    "蓝铁瓶（锦草）": "Ferrium Bottle (Jincao)",
+    "蓝铁瓶（芽针）": "Ferrium Bottle (Yazhen)",
+    "蓝铁瓶（净水）": "Ferrium Bottle (Clean Water)",
+    "蓝铁瓶（液化息壤）": "Ferrium Bottle (Liquid Xiranite)",
+    # Steel Bottle filled variants
+    "钢质瓶（锦草）": "Steel Bottle (Jincao)",
+    "钢质瓶（芽针）": "Steel Bottle (Yazhen)",
+    "钢质瓶（净水）": "Steel Bottle (Clean Water)",
+    "钢质瓶（液化息壤）": "Steel Bottle (Liquid Xiranite)",
     # Cuprium Canister filled variants
     "辉铜罐（水原气）": "Cuprium Canister (Aquagen)",
     "辉铜罐（酸原气）": "Cuprium Canister (Acridgen)",
@@ -123,6 +142,7 @@ ITEM_GAME_ENGLISH = {
     "辉铜罐（重息原气）": "Cuprium Canister (Heavy Xiragen)",
     "辉铜罐（辉铜气）": "Cuprium Canister (Cuprium Gas)",
     "辉铜罐（赫铜气）": "Cuprium Canister (Hetonite Gas)",
+    "辉铜罐（惰气）": "Cuprium Canister (Inergen)",
     # Powders
     "源石粉末": "Originium Powder",
     "碳粉末": "Carbon Powder",
