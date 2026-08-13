@@ -9,7 +9,7 @@ import win32con
 from qfluentwidgets import FluentIcon
 
 from src.data.world_map import item_to_warehouse_dict
-from src.data.zh_en import ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH, ITEM_TRANSLATION_DICT
+from src.data.zh_en import ITEM_WAREHOUSE_CATEGORY_EN_BY_ZH, ITEM_TRANSLATION_DICT, ITEM_GAME_ENGLISH
 from src.core.BaseEfTask import BaseEfTask
 from src.icons import Icons
 from src.ocr import ocr_text, ocr_match, ensure_tesseract
@@ -398,6 +398,31 @@ class WarehouseTransferTask(BaseEfTask):
         lParam = win32api.MAKELONG(abs_x, abs_y)  # screen coords for WM_MOUSEWHEEL
         win32gui.PostMessage(interaction.hwnd, WM_MOUSEWHEEL, wParam, lParam)
 
+    @staticmethod
+    def _fuzzy_match(ocr_text: str, target: str) -> bool:
+        """Check if OCR text matches target, tolerating common Tesseract errors.
+
+        Handles: substring containment, and SequenceMatcher ratio >= 0.82
+        for the title portion (tolerates 1-2 char errors in a typical item name).
+        """
+        if not ocr_text or not target:
+            return False
+        # Exact substring match
+        if target in ocr_text or ocr_text in target:
+            return True
+        # Clean OCR: strip trailing non-alpha, leading junk
+        import re
+        clean = re.sub(r'[^a-z0-9\s\'\-\[\]]', '', ocr_text).strip()
+        # Compare title portion only (before |)
+        title_part = clean.split('|')[0].strip() if '|' in clean else clean
+        if target in title_part or title_part in target:
+            return True
+        # Fuzzy match: ratio >= 0.82 catches "powdel"→"powder" but rejects
+        # different items with shared prefix like "dense carbon" vs "dense originium"
+        from difflib import SequenceMatcher
+        ratio = SequenceMatcher(None, title_part, target).ratio()
+        return ratio >= 0.82
+
     def _scan_grid_for_item(self, item_key_zh: str):
         """
         Scan the item grid by hovering each cell and reading the tooltip via OCR.
@@ -413,11 +438,13 @@ class WarehouseTransferTask(BaseEfTask):
         """
         from ok.feature.Box import Box
 
-        # Build match targets: Chinese name + English code name (spaces/underscores normalized)
+        # Build match targets: Chinese name + game English name + internal code name
         targets = [item_key_zh.lower()]
+        game_en = ITEM_GAME_ENGLISH.get(item_key_zh, "")
+        if game_en:
+            targets.append(game_en.lower())
         en_code = ITEM_TRANSLATION_DICT.get(item_key_zh, "")
         if en_code:
-            # "dense_source_ore_powder" -> match "dense" "source" "ore" "powder" as substrings
             targets.append(en_code.replace("_", " ").lower())
 
         w, h = self.width, self.height
@@ -468,9 +495,9 @@ class WarehouseTransferTask(BaseEfTask):
                     # Tooltip appears BELOW and to the RIGHT of the cursor.
                     # Taller region captures subtitle lines like "Filled with Xircon Effluent".
                     tooltip_x1 = min(w, int(cx_px + 48))
-                    tooltip_x2 = min(w, int(cx_px + 620))
+                    tooltip_x2 = min(w, int(cx_px + 700))
                     tooltip_y1 = max(0, int(cy_px + 15))
-                    tooltip_y2 = min(h, int(cy_px + 195))
+                    tooltip_y2 = min(h, int(cy_px + 225))
 
                     row_captures.append((col, cx_px, cy_px, frame.copy(),
                                          (tooltip_x1, tooltip_y1, tooltip_x2, tooltip_y2)))
@@ -489,28 +516,39 @@ class WarehouseTransferTask(BaseEfTask):
                     except Exception as e:
                         self.log_info(f"[grid_scan] screenshot save failed: {e}")
 
-                    text = ocr_text(frame, box=(tx1, ty1, tx2, ty2), psm=6)
-                    text = text.strip()
+                    # Split tooltip into 3 vertical bands to avoid mixing lines.
+                    # Measured from tooltips: title y=18-57, category y=78-108, desc y=132-165
+                    # in a 180px crop. Scale proportionally for current crop height.
+                    crop_h = ty2 - ty1
+                    band1_end = int(crop_h * 0.33)    # title ends at ~33%
+                    band2_end = int(crop_h * 0.58)    # category ends at ~58%
+                    title_text = ocr_text(frame, box=(tx1, ty1, tx1 + (tx2 - tx1), ty1 + band1_end), psm=7)
+                    title_text = title_text.strip().split('\n')[0].strip()  # first line only
 
-                    if not text and col == 0 and scroll_round == 0:
+                    if not title_text and col == 0 and scroll_round == 0:
                         from src.ocr.tesseract_ocr import _initialized, _ocr_diag
                         self.log_info(f"[grid_scan] ({row},{col}) empty! _initialized={_initialized}, "
                                       f"box=({tx1},{ty1},{tx2},{ty2}), shape={frame.shape}, "
                                       f"diag={_ocr_diag}")
 
-                    if text:
-                        self.log_info(f"[grid_scan] ({row},{col}) -> '{text}'")
-                        seen_items.add(text.lower())
+                    if title_text:
+                        # Also OCR the description band (line 3) for subtitle matching
+                        desc_text = ocr_text(frame, box=(tx1, ty1 + band2_end, tx2, ty2), psm=7)
+                        desc_text = desc_text.strip().split('\n')[0].strip()
+                        full_text = title_text if not desc_text else f"{title_text} | {desc_text}"
+
+                        self.log_info(f"[grid_scan] ({row},{col}) -> '{full_text}'")
+                        seen_items.add(title_text.lower())
 
                         if row == 0 and col == 0 and top_left_text is None:
-                            top_left_text = text
+                            top_left_text = title_text
 
-                        text_lower = text.lower()
+                        match_text = full_text.lower()
                         for target in targets:
-                            if target in text_lower or text_lower in target:
-                                self.log_info(f"[grid_scan] FOUND '{target}' in '{text}' at ({row},{col})")
+                            if self._fuzzy_match(match_text, target):
+                                self.log_info(f"[grid_scan] FOUND '{target}' in '{full_text}' at ({row},{col})")
                                 return Box(cx_px - int(col_width * w / 2), cy_px - int(row_height * h / 2),
-                                           int(col_width * w), int(row_height * h), name=text)
+                                           int(col_width * w), int(row_height * h), name=title_text)
                     else:
                         self.log_info(f"[grid_scan] ({row},{col}) empty")
 
@@ -521,15 +559,14 @@ class WarehouseTransferTask(BaseEfTask):
                 break
             last_top_left_text = top_left_text
 
-            # Scroll down exactly 3 rows using precise WM_MOUSEWHEEL delta.
-            # Measured: 1 notch (120 delta) = 1.667 rows = 342px.
-            # 3 rows = 615px = 1.8 notches = delta 216.
-            # This gives 1 row overlap with the 4-row grid (no items skipped).
+            # Scroll down using precise WM_MOUSEWHEEL delta.
+            # Measured: delta 216 = exactly 4 rows (0 overlap). Increase to 240
+            # for ~4.4 rows advancement, giving slight overlap to prevent drift.
             scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
             scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
             self._hover_absolute(scroll_x, scroll_y)
             self.sleep(0.2)
-            self._scroll_precise(scroll_x, scroll_y, -216)
+            self._scroll_precise(scroll_x, scroll_y, -240)
             self.sleep(1.2)
             # Discard stale frame so next_frame() returns fresh content
             self.next_frame()
