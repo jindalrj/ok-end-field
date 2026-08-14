@@ -1616,3 +1616,21 @@ msgstr "Calibración del coeficiente de rotación del ratón"
 
 msgid "齐纶"
 msgstr "Qí Lún"
+
+msgid "多物品仓库转移"
+msgstr "Transferencia multiartículo de almacén"
+
+msgid "勾选多个物品自动倒仓：先盘点两侧仓库库存，再按容量规则逐一转移"
+msgstr "Marca varios artículos para transferirlos automáticamente: inventaría ambos almacenes y transfiere según las reglas de capacidad"
+
+msgid "转移方向1"
+msgstr "Dirección 1"
+
+msgid "转移物品1"
+msgstr "Artículos 1"
+
+msgid "转移方向2"
+msgstr "Dirección 2"
+
+msgid "转移物品2"
+msgstr "Artículos 2"

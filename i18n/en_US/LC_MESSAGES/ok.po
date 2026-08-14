@@ -1614,3 +1614,21 @@ msgstr "Mouse Rotation Calibration"
 
 msgid "齐纶"
 msgstr "Qi Lun"
+
+msgid "多物品仓库转移"
+msgstr "Multi-Item Warehouse Transfer"
+
+msgid "勾选多个物品自动倒仓：先盘点两侧仓库库存，再按容量规则逐一转移"
+msgstr "Check multiple items to auto-transfer: inventories both depots first, then transfers each item per capacity rules"
+
+msgid "转移方向1"
+msgstr "Direction 1"
+
+msgid "转移物品1"
+msgstr "Items 1"
+
+msgid "转移方向2"
+msgstr "Direction 2"
+
+msgid "转移物品2"
+msgstr "Items 2"

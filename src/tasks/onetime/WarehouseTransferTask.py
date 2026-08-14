@@ -823,10 +823,117 @@ class WarehouseTransferTask(BaseEfTask):
         return targets
 
 
+    def _scan_row_cells(self, row: int, scroll_round: int, debug_prefix: str = "r") -> list[dict]:
+        """Hover every cell in one grid row; OCR tooltip title/desc + count.
+
+        Extracted verbatim from the verified single-item scan pipeline.
+        Returns one dict per captured cell (cells whose frame grab failed
+        are skipped; cells with no tooltip text have title ""):
+          {"col", "cx", "cy", "title", "desc", "count"}
+        """
+        w, h = self.width, self.height
+        col_width = (self._GRID_RIGHT - self._GRID_LEFT) / self._GRID_COLS
+        row_height = (self._GRID_BOTTOM - self._GRID_TOP) / self._GRID_ROWS
+        half_cw = int(col_width * w / 2)
+        half_ch = int(row_height * h / 2)
+        debug_dir = self._debug_dir()
+
+        # Phase 1: Hover each cell to capture tooltip
+        row_captures = []
+        for col in range(self._GRID_COLS):
+            cx_px = int((self._GRID_LEFT + col_width * (col + 0.5)) * w)
+            cy_px = int((self._GRID_TOP + row_height * (row + 0.5)) * h)
+            self._hover_absolute(cx_px, cy_px)
+            self.sleep(0.65)
+            self.next_frame()
+            frame = self.executor.frame
+            if frame is None:
+                continue
+            tx1 = min(w, cx_px + 48)
+            tx2 = min(w, cx_px + 700)
+            ty1 = max(0, cy_px + 15)
+            ty2 = min(h, cy_px + 225)
+            row_captures.append((col, cx_px, cy_px, frame.copy(), (tx1, ty1, tx2, ty2)))
+
+        # Phase 2: Move cursor away from grid, capture clean frame for counts
+        safe_x = int(0.75 * w)  # backpack area (right side)
+        safe_y = int(0.50 * h)
+        self._hover_absolute(safe_x, safe_y)
+        self.sleep(0.4)
+        self.next_frame()
+        clean_frame = self.executor.frame
+        if clean_frame is None:
+            clean_frame = row_captures[-1][3] if row_captures else None
+
+        # Move cursor back to grid center (scroll requires cursor in grid area)
+        grid_cx = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
+        grid_cy = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
+        self._hover_absolute(grid_cx, grid_cy)
+        self.sleep(0.15)
+
+        # Phase 3: Read counts from clean frame (no tooltip overlay)
+        row_counts = {}
+        if clean_frame is not None:
+            for col, cx_px, cy_px, _, _ in row_captures:
+                count_str = self._count_ocr_cell(clean_frame, cx_px, cy_px, half_cw, half_ch)
+                row_counts[col] = self._parse_count(count_str)
+
+        # Phase 4: OCR tooltips for item names
+        results = []
+        for col, cx_px, cy_px, frame, (tx1, ty1, tx2, ty2) in row_captures:
+            # OCR tooltip via preprocessing (color-based text isolation)
+            tooltip_crop = frame[ty1:ty2, tx1:tx2]
+            title_text, desc_text = self._extract_tooltip_text(tooltip_crop)
+
+            try:
+                debug_frame = frame.copy()
+                cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (0, 255, 0), 3)
+                cv2.circle(debug_frame, (cx_px, cy_px), 12, (0, 0, 255), -1)
+                cv2.imwrite(str(debug_dir / f"{debug_prefix}{scroll_round}_cell_{row}_{col}.png"), debug_frame)
+                if tooltip_crop.size > 0:
+                    cv2.imwrite(str(debug_dir / f"{debug_prefix}{scroll_round}_tooltip_{row}_{col}.png"), tooltip_crop)
+                # Save the preprocessed title image that was actually sent to OCR
+                if title_text:
+                    h_c, w_c = tooltip_crop.shape[:2]
+                    hsv_c = cv2.cvtColor(tooltip_crop, cv2.COLOR_BGR2HSV)
+                    val_c = hsv_c[:, :, 2]
+                    sat_c = hsv_c[:, :, 1]
+                    t_mask = (val_c > 170) & (sat_c < 60)
+                    t_rows = np.where(t_mask.sum(axis=1) > 5)[0]
+                    if len(t_rows) > 0:
+                        t_top = max(0, t_rows[0] - 2)
+                        t_bot = min(h_c, t_rows[0] + 40)
+                        title_debug = tooltip_crop[t_top:t_bot, :]
+                        cv2.imwrite(str(debug_dir / f"{debug_prefix}{scroll_round}_title_{row}_{col}.png"), title_debug)
+            except Exception:
+                pass
+
+            item_count = row_counts.get(col, 0)
+
+            if not title_text and col == 0 and scroll_round == 0:
+                self.log_info(f"[grid_scan] ({row},{col}) empty! diag={_ocr_diag}")
+
+            results.append({"col": col, "cx": cx_px, "cy": cy_px,
+                            "title": title_text, "desc": desc_text, "count": item_count})
+        return results
+
+    def _scroll_grid_page(self):
+        """Scroll the item grid down by one page (~4 rows)."""
+        w, h = self.width, self.height
+        scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
+        scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
+        self._hover_absolute(scroll_x, scroll_y)
+        self.sleep(0.2)
+        self._scroll_precise(scroll_x, scroll_y, -230)
+        self.sleep(1.2)
+        self.next_frame()
+        self.sleep(0.3)
+
     def _scan_grid_for_item(self, item_key: str):
         """Scan item grid by hovering each cell, reading tooltip via OCR.
 
-        Returns a Box at the bottom-right-most match, or None.
+        Returns a Box at the bottom-right-most match, or None. The count
+        of the matched cell is exposed as self._last_scan_count.
         """
         targets = self._build_match_targets(item_key)
         w, h = self.width, self.height
@@ -840,93 +947,23 @@ class WarehouseTransferTask(BaseEfTask):
         last_match = None
         last_match_count = 0
         best_score = 0.0
+        self._last_scan_count = 0
 
         self.log_info(f"[grid_scan] targets={targets}, grid={self._GRID_COLS}x{self._GRID_ROWS}")
         if not _tess_mod._initialized:
             self.log_info("[grid_scan] WARNING: tesseract not initialized!")
-
-        debug_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ok-ef" / "grid_scan_debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
 
         for scroll_round in range(8):
             self.log_info(f"[grid_scan] --- round {scroll_round} ---")
             top_left_text = None
 
             for row in range(self._GRID_ROWS):
-                # Phase 1: Hover each cell to capture tooltip
-                row_captures = []
-                for col in range(self._GRID_COLS):
-                    cx_px = int((self._GRID_LEFT + col_width * (col + 0.5)) * w)
-                    cy_px = int((self._GRID_TOP + row_height * (row + 0.5)) * h)
-                    self._hover_absolute(cx_px, cy_px)
-                    self.sleep(0.65)
-                    self.next_frame()
-                    frame = self.executor.frame
-                    if frame is None:
-                        continue
-                    tx1 = min(w, cx_px + 48)
-                    tx2 = min(w, cx_px + 700)
-                    ty1 = max(0, cy_px + 15)
-                    ty2 = min(h, cy_px + 225)
-                    row_captures.append((col, cx_px, cy_px, frame.copy(), (tx1, ty1, tx2, ty2)))
-
-                # Phase 2: Move cursor away from grid, capture clean frame for counts
-                safe_x = int(0.75 * w)  # backpack area (right side)
-                safe_y = int(0.50 * h)
-                self._hover_absolute(safe_x, safe_y)
-                self.sleep(0.4)
-                self.next_frame()
-                clean_frame = self.executor.frame
-                if clean_frame is None:
-                    clean_frame = row_captures[-1][3] if row_captures else None
-
-                # Move cursor back to grid center (scroll requires cursor in grid area)
-                grid_cx = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
-                grid_cy = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
-                self._hover_absolute(grid_cx, grid_cy)
-                self.sleep(0.15)
-
-                # Phase 3: Read counts from clean frame (no tooltip overlay)
-                row_counts = {}
-                if clean_frame is not None:
-                    for col, cx_px, cy_px, _, _ in row_captures:
-                        count_str = self._count_ocr_cell(clean_frame, cx_px, cy_px, half_cw, half_ch)
-                        row_counts[col] = self._parse_count(count_str)
-
-                # Phase 4: OCR tooltips for item names
-                for col, cx_px, cy_px, frame, (tx1, ty1, tx2, ty2) in row_captures:
-                    # OCR tooltip via preprocessing (color-based text isolation)
-                    tooltip_crop = frame[ty1:ty2, tx1:tx2]
-                    title_text, desc_text = self._extract_tooltip_text(tooltip_crop)
-
-                    try:
-                        debug_frame = frame.copy()
-                        cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (0, 255, 0), 3)
-                        cv2.circle(debug_frame, (cx_px, cy_px), 12, (0, 0, 255), -1)
-                        cv2.imwrite(str(debug_dir / f"r{scroll_round}_cell_{row}_{col}.png"), debug_frame)
-                        if tooltip_crop.size > 0:
-                            cv2.imwrite(str(debug_dir / f"r{scroll_round}_tooltip_{row}_{col}.png"), tooltip_crop)
-                        # Save the preprocessed title image that was actually sent to OCR
-                        if title_text:
-                            h_c, w_c = tooltip_crop.shape[:2]
-                            hsv_c = cv2.cvtColor(tooltip_crop, cv2.COLOR_BGR2HSV)
-                            val_c = hsv_c[:, :, 2]
-                            sat_c = hsv_c[:, :, 1]
-                            t_mask = (val_c > 170) & (sat_c < 60)
-                            t_rows = np.where(t_mask.sum(axis=1) > 5)[0]
-                            if len(t_rows) > 0:
-                                t_top = max(0, t_rows[0] - 2)
-                                t_bot = min(h_c, t_rows[0] + 40)
-                                title_debug = tooltip_crop[t_top:t_bot, :]
-                                cv2.imwrite(str(debug_dir / f"r{scroll_round}_title_{row}_{col}.png"), title_debug)
-                    except Exception:
-                        pass
-
-                    item_count = row_counts.get(col, 0)
+                for cell in self._scan_row_cells(row, scroll_round):
+                    col = cell["col"]
+                    title_text, desc_text = cell["title"], cell["desc"]
+                    item_count = cell["count"]
 
                     if not title_text:
-                        if col == 0 and scroll_round == 0:
-                            self.log_info(f"[grid_scan] ({row},{col}) empty! diag={_ocr_diag}")
                         continue
 
                     full_text = title_text if not desc_text else f"{title_text} | {desc_text}"
@@ -944,7 +981,7 @@ class WarehouseTransferTask(BaseEfTask):
                     # partial stack the game would deplete first).
                     if score > 0.0 and score >= best_score:
                         best_score = score
-                        last_match = Box(cx_px - half_cw, cy_px - half_ch,
+                        last_match = Box(cell["cx"] - half_cw, cell["cy"] - half_ch,
                                          int(col_width * w), int(row_height * h), name=title_text)
                         last_match_count = item_count
                         self.log_info(f"[grid_scan] MATCH at ({row},{col}) score={score:.3f}{count_label}")
@@ -952,6 +989,7 @@ class WarehouseTransferTask(BaseEfTask):
             if last_match:
                 self.log_info(f"[grid_scan] returning: '{last_match.name}' x{last_match_count} "
                               f"score={best_score:.3f}")
+                self._last_scan_count = last_match_count
                 return last_match
 
             if top_left_text and top_left_text == last_top_left_text:
@@ -959,15 +997,7 @@ class WarehouseTransferTask(BaseEfTask):
                 break
             last_top_left_text = top_left_text
 
-            # Scroll down ~4 rows
-            scroll_x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
-            scroll_y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
-            self._hover_absolute(scroll_x, scroll_y)
-            self.sleep(0.2)
-            self._scroll_precise(scroll_x, scroll_y, -230)
-            self.sleep(1.2)
-            self.next_frame()
-            self.sleep(0.3)
+            self._scroll_grid_page()
 
         self.log_info(f"[grid_scan] NOT found. Seen: {sorted(seen_items)}")
         return None
@@ -1044,6 +1074,38 @@ class WarehouseTransferTask(BaseEfTask):
         self._ctrl_click(Box(cx - cell // 2, cy - cell // 2, cell, cell, name="backpack_item"))
         return True
 
+    def _do_deposit(self):
+        """Deposit the withdrawn item at the current (destination) depot.
+
+        Ctrl-clicks the backpack item - Quick Stash silently fails for
+        some items (game-side issue). Fallbacks: fixed bottom-right
+        backpack cell position, then the Quick Stash button (OCR-gated).
+        """
+        self.log_info("[store] depositing via backpack ctrl-click")
+        if not self._deposit_backpack_item():
+            # Fallback 1: fixed position of bottom-right backpack cell
+            # (user-measured red dot, rel 0.8430/0.6301 at 4K).
+            self.log_info("[store] detection failed, ctrl-clicking fixed position")
+            cell = int(0.0538 * self.width)
+            cx = int(0.8430 * self.width)
+            cy = int(0.6301 * self.height)
+            self._ctrl_click(Box(cx - cell // 2, cy - cell // 2, cell, cell,
+                                 name="backpack_fixed"))
+            # Fallback 2: Quick Stash button (works for most items).
+            # Pill measured on r0_cell_0_0.png (4K): x 0.632-0.739,
+            # y 0.699-0.738.
+            store_text = self.lang.WarehouseTransferTask.k_d661f6da
+            self.next_frame()
+            frame = self.executor.frame
+            if frame is not None:
+                h, w = frame.shape[:2]
+                store_box = (int(w * 0.625), int(h * 0.695), int(w * 0.75), int(h * 0.745))
+                if ocr_match(frame, store_box, store_text):
+                    self.log_info("[store] fallback: clicking Quick Stash")
+                    self.click_relative(0.67, 0.718)
+        # Deposit usually has NO confirm dialog - never blind-click
+        self._maybe_click_confirm(positional_fallback=False)
+
     def run(self):
         self.ensure_main()
         try:
@@ -1101,32 +1163,7 @@ class WarehouseTransferTask(BaseEfTask):
             self.log_info(f"[run] switching to destination={to_key}")
             self._switch_location(to_key)
 
-            # Deposit via ctrl-click on the backpack item - Quick Stash
-            # silently fails for some items (game-side issue).
-            self.log_info("[store] depositing via backpack ctrl-click")
-            if not self._deposit_backpack_item():
-                # Fallback 1: fixed position of bottom-right backpack cell
-                # (user-measured red dot, rel 0.8430/0.6301 at 4K).
-                self.log_info("[store] detection failed, ctrl-clicking fixed position")
-                cell = int(0.0538 * self.width)
-                cx = int(0.8430 * self.width)
-                cy = int(0.6301 * self.height)
-                self._ctrl_click(Box(cx - cell // 2, cy - cell // 2, cell, cell,
-                                     name="backpack_fixed"))
-                # Fallback 2: Quick Stash button (works for most items).
-                # Pill measured on r0_cell_0_0.png (4K): x 0.632-0.739,
-                # y 0.699-0.738.
-                store_text = self.lang.WarehouseTransferTask.k_d661f6da
-                self.next_frame()
-                frame = self.executor.frame
-                if frame is not None:
-                    h, w = frame.shape[:2]
-                    store_box = (int(w * 0.625), int(h * 0.695), int(w * 0.75), int(h * 0.745))
-                    if ocr_match(frame, store_box, store_text):
-                        self.log_info("[store] fallback: clicking Quick Stash")
-                        self.click_relative(0.67, 0.718)
-            # Deposit usually has NO confirm dialog - never blind-click
-            self._maybe_click_confirm(positional_fallback=False)
+            self._do_deposit()
             max_times -= 1
             if max_times <= 0:
                 break

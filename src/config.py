@@ -129,6 +129,7 @@ config = {
     "onetime_tasks": [  # 用户点击触发的任务（一次性业务任务在前，调试/测试任务在后）
         ["src.tasks.onetime.DailyTask", "DailyTask"],
         ["src.tasks.onetime.TakeDeliveryTask", "TakeDeliveryTask"],
+        ["src.tasks.onetime.MultiItemWarehouseTransferTask", "MultiItemWarehouseTransferTask"],
         ["src.tasks.onetime.WarehouseTransferTask", "WarehouseTransferTask"],
         ["src.tasks.onetime.DeliveryTask", "DeliveryTask"],
         ["src.tasks.onetime.BattleTask", "BattleTask"],
