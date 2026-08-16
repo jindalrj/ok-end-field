@@ -8,7 +8,10 @@ filters transfers by capacity rules:
     (per-item depot limits: Valley IV 80K, Wuling 90K)
   - source must hold > 2K of the item
 Eligible transfers are then executed one by one, round by round, until a
-limit is reached - no manual round counting needed.
+limit is reached - no manual round counting needed. A single ctrl-click
+withdraws only what fits in the backpack (~1.5-2K depending on empty
+cells), NOT the whole stack, so the amount actually moved per round is
+measured by re-reading the source cell count after the withdrawal.
 
 Reuses the verified scan/switch/deposit machinery from WarehouseTransferTask.
 """
@@ -29,7 +32,7 @@ _DIR_W2V = "wuling -> valley4"
 _DEPOT_LIMITS = {"valley4": 80000, "wuling": 90000}
 _DEST_HEADROOM = 5000   # destination needs > 5K free capacity
 _SOURCE_MIN = 2000      # source must keep / have > 2K
-_MAX_ROUNDS_PER_ITEM = 30  # safety cap per item
+_MAX_ROUNDS_PER_ITEM = 60  # ~1.5-2K/round -> a full 80K depot needs ~53 rounds
 
 
 class MultiItemWarehouseTransferTask(WarehouseTransferTask):
@@ -201,12 +204,62 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
 
     # ---------- transfer ----------
 
+    def _read_cell_item_count(self, box, item: str) -> tuple[bool, int]:
+        """Re-read one grid cell after a withdrawal.
+
+        Hover the cell to check via tooltip that it still holds `item`,
+        then move the cursor to the safe spot and read the count from a
+        clean frame (the tooltip overlays the count band, same reason
+        _scan_row_cells uses a separate clean frame for counts).
+
+        Returns (still_same_item, count). count == 0 with still_same_item
+        True means the count OCR failed.
+        """
+        w, h = self.width, self.height
+        col_width = (self._GRID_RIGHT - self._GRID_LEFT) / self._GRID_COLS
+        row_height = (self._GRID_BOTTOM - self._GRID_TOP) / self._GRID_ROWS
+        half_cw = int(col_width * w / 2)
+        half_ch = int(row_height * h / 2)
+        cx = box.x + box.width // 2
+        cy = box.y + box.height // 2
+
+        self._hover_absolute(cx, cy)
+        self.sleep(0.65)
+        self.next_frame()
+        frame = self.executor.frame
+        title_text, desc_text = "", ""
+        if frame is not None:
+            tx1, tx2 = min(w, cx + 48), min(w, cx + 700)
+            ty1, ty2 = max(0, cy + 15), min(h, cy + 225)
+            title_text, desc_text = self._extract_tooltip_text(frame[ty1:ty2, tx1:tx2])
+        if not title_text:
+            return False, 0
+        full_text = (title_text if not desc_text else f"{title_text} | {desc_text}").lower()
+        score = max(item_match_score(full_text, t, _MATCH_VOCAB)
+                    for t in self._build_match_targets(item))
+        if score <= 0.0:
+            return False, 0
+
+        # Cursor away so the tooltip disappears, then read count clean
+        self._hover_absolute(int(0.75 * w), int(0.50 * h))
+        self.sleep(0.4)
+        self.next_frame()
+        clean = self.executor.frame
+        if clean is None:
+            return True, 0
+        count = self._parse_count(self._count_ocr_cell(clean, cx, cy, half_cw, half_ch))
+        return True, count
+
     def _transfer_item(self, item: str, from_key: str, to_key: str,
                        src_count: int, dst_count: int) -> int:
         """Transfer one item round by round until a capacity rule stops it.
 
-        Counts are tracked incrementally from the withdrawn cell counts,
-        so no re-inventory is needed between rounds.
+        A ctrl-click withdraws only what fits in the backpack (~1.5-2K),
+        so the moved amount is MEASURED each round: re-read the source
+        cell count after the withdrawal, moved = before - after. If the
+        cell no longer shows the item (or shows a larger count from a
+        same-item stack shifting in), the whole stack was withdrawn.
+        Counts are tracked incrementally - no re-inventory between rounds.
         """
         limit = _DEPOT_LIMITS[to_key]
         moved_total = 0
@@ -225,13 +278,28 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
             if not icon:
                 self.log_info(f"[transfer] '{item}': no longer found in source, done")
                 break
-            moved = self._last_scan_count
+            before = self._last_scan_count
             self._ctrl_click(icon)
             self.sleep(0.35)
+
+            same, after = self._read_cell_item_count(icon, item)
+            moved = 0
+            if before > 0:
+                if not same or after > before:
+                    moved = before  # whole stack withdrawn (grid shifted)
+                elif 0 < after < before:
+                    moved = before - after  # partial withdrawal (normal case)
+                # after == before -> nothing withdrawn; after == 0 -> OCR failed
+            if before > 0 and same and after == before:
+                self.log_info(f"[transfer] '{item}': cell count unchanged after "
+                              f"ctrl-click (backpack full?), stopping this item")
+                break  # nothing entered the backpack - no deposit needed
+
             self._switch_location(to_key)
             self._do_deposit()
             if moved <= 0:
-                self.log_info(f"[transfer] '{item}': withdrawn count unknown, "
+                self.log_info(f"[transfer] '{item}': withdrawn count unknown "
+                              f"(before={before}, same={same}, after={after}), "
                               f"stopping this item for safety")
                 break
             src_count -= moved
