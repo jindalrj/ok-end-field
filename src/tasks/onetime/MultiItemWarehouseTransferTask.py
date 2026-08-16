@@ -16,12 +16,14 @@ measured by re-reading the source cell count after the withdrawal.
 Reuses the verified scan/switch/deposit machinery from WarehouseTransferTask.
 """
 
+import cv2
+import numpy as np
 from qfluentwidgets import FluentIcon
 
-from src.data.world_map import item_to_warehouse_dict
+from ok.feature.Box import Box
 from src.data.zh_en import ITEM_GAME_ENGLISH
 from src.icons import Icons
-from src.ocr import ensure_tesseract
+from src.ocr import ensure_tesseract, ocr_match
 from src.tasks.onetime.item_matcher import match_score as item_match_score
 from src.tasks.onetime.WarehouseTransferTask import WarehouseTransferTask, _MATCH_VOCAB
 
@@ -107,13 +109,6 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
 
     # ---------- inventory ----------
 
-    def _item_category(self, item: str) -> str:
-        zh = item
-        if item not in item_to_warehouse_dict:
-            en_to_zh = {v.lower(): k for k, v in ITEM_GAME_ENGLISH.items()}
-            zh = en_to_zh.get(item.lower(), item)
-        return item_to_warehouse_dict.get(zh, "")
-
     def _scroll_grid_to_top(self):
         """Scroll the item grid back to the top (10 page-up scrolls).
 
@@ -133,22 +128,42 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
         self.next_frame()
 
     def _scan_counts_for_items(self, items: list[str], depot: str) -> dict[str, int]:
-        """Scan the current category page and total the counts per item.
+        """Scan the full item grid once and total the counts per item.
 
-        Consecutive pages can overlap when the final scroll clamps at the
-        list end (scroll moves a full 4-row page normally). Overlapping
-        leading rows - identical (text, count) signature to the previous
-        page's trailing rows - are skipped to avoid double counting.
+        Scrolling moves a full 4-row page except at the list end, where
+        the scroll clamps: the last page shows the final ~3.8 rows
+        slightly misaligned. Titles still read fine there but count OCR
+        is unreliable, so:
+          - row 0 is scanned FIRST each page; if its top-left title
+            equals the previous page's top-left title the page is a
+            repeat - stop immediately, without rescanning the remaining
+            rows or touching the totals;
+          - page overlap is deduped by TITLE-only row signatures, so a
+            misread count can neither double-count a row nor defeat the
+            identical-page check.
         """
         targets_by_item = {it: self._build_match_targets(it) for it in items}
         counts = {it: 0 for it in items}
+        prev_top_left = None
         prev_sigs = None
 
         for scroll_round in range(12):
             self.log_info(f"[inventory] {depot} --- page {scroll_round} ---")
-            page_rows = []  # list of (row_signature, row_cells)
-            for row in range(self._GRID_ROWS):
-                cells = self._scan_row_cells(row, scroll_round, debug_prefix=f"inv_{depot}_")
+
+            # Row 0 first: cheap repeat check before scanning rows 1-3
+            row0 = self._scan_row_cells(0, scroll_round, debug_prefix=f"inv_{depot}_")
+            top_left = next((c["title"].lower() for c in row0 if c["col"] == 0), "")
+            if top_left and top_left == prev_top_left:
+                self.log_info("[inventory] top-left unchanged - end of list")
+                break
+            prev_top_left = top_left or prev_top_left
+
+            rows = [row0]
+            for row in range(1, self._GRID_ROWS):
+                rows.append(self._scan_row_cells(row, scroll_round, debug_prefix=f"inv_{depot}_"))
+
+            page_rows = []  # list of (title_only_signature, row_cells)
+            for row, cells in enumerate(rows):
                 row_cells = []
                 for cell in cells:
                     title, desc, count = cell["title"], cell["desc"], cell["count"]
@@ -157,7 +172,8 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
                         full_text = (title if not desc else f"{title} | {desc}").lower()
                         self.log_info(f"[inventory] ({row},{cell['col']}) -> '{full_text}' x{count}")
                     row_cells.append((full_text, count))
-                page_rows.append((tuple(row_cells), row_cells))
+                title_sig = tuple(ft.split(" | ")[0] for ft, _ in row_cells)
+                page_rows.append((title_sig, row_cells))
 
             sigs = [sig for sig, _ in page_rows]
             overlap = 0
@@ -196,17 +212,142 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
         return counts
 
     def _inventory_depot(self, depot: str, items: list[str]) -> dict[str, int]:
-        """Inventory the given items at the current depot, one category page at a time."""
-        by_cat: dict[str, list[str]] = {}
-        for it in items:
-            by_cat.setdefault(self._item_category(it), []).append(it)
-        counts: dict[str, int] = {}
-        for cat, cat_items in sorted(by_cat.items()):
-            self.log_info(f"[inventory] {depot}: category '{cat}' items={cat_items}")
-            self._to_one_type_page(cat_items[0])
-            self._scroll_grid_to_top()
-            counts.update(self._scan_counts_for_items(cat_items, depot))
-        return counts
+        """Inventory ALL given items at the current depot in a single scan.
+
+        Category tabs do NOT filter the depot grid (2026-08-16 log: the
+        per-category scans all saw the identical full item list), so one
+        full-list pass covers every selected item - no tab navigation.
+        """
+        self.log_info(f"[inventory] {depot}: single full-list scan for {items}")
+        self._scroll_grid_to_top()
+        return self._scan_counts_for_items(items, depot)
+
+    # ---------- deposit ----------
+
+    # Cursor park spot that hovers NO cell: the gutter between the depot
+    # grid (right edge 0.5542) and the backpack cells (left edge 0.599).
+    # The old park spot (0.75, 0.50) sits ON a backpack cell - its tooltip
+    # covered neighbouring cells and hid them from the occupancy mask
+    # (verified on deposit_backpack.png from the 2026-08-16 12:36 run).
+    _BACKPACK_PARK = (0.578, 0.50)
+
+    def _backpack_occupied_cells(self, debug_name: str = None) -> dict:
+        """Map (row, col) -> (cx, cy) px of occupied visible backpack cells.
+
+        Parks the cursor in the panel gutter first so no tooltip hides
+        cells, then applies the parent's verified rarity-bar mask
+        (sat>80 & val>80, fog-immune).
+        """
+        w, h = self.width, self.height
+        self._hover_absolute(int(self._BACKPACK_PARK[0] * w), int(self._BACKPACK_PARK[1] * h))
+        self.sleep(0.4)
+        self.next_frame()
+        frame = self.executor.frame
+        if frame is None:
+            return {}
+        l, t, r, b = self._BACKPACK_REGION
+        x0, y0 = int(l * w), int(t * h)
+        x1, y1 = int(r * w), int(b * h)
+        region = frame[y0:y1, x0:x1]
+        if region.size == 0:
+            return {}
+        cell = int(0.0538 * w)
+
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        mask = ((hsv[:, :, 1] > 80) & (hsv[:, :, 2] > 80)).astype(np.uint8)
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+        cells = {}
+        for i in range(1, n):
+            bx, by, bw, bh, area = stats[i]
+            if area < 2000 or not (0.7 * cell <= bw <= 1.1 * cell):
+                continue
+            cx = x0 + bx + bw // 2
+            cy = y0 + by + bh - cell // 2
+            rc = (int((cy - y0) / cell), int((cx - x0) / cell))
+            cells[rc] = (cx, cy)
+
+        if debug_name:
+            boxes = [((cx - cell // 2, cy - cell // 2, cx + cell // 2, cy + cell // 2),
+                      f"{rc[0]},{rc[1]}") for rc, (cx, cy) in cells.items()]
+            self._save_switch_debug(debug_name, frame,
+                                    boxes=boxes or [((x0, y0, x1, y1), "no occupied cell")])
+        return cells
+
+    def _quick_stash_fallback(self):
+        """Click the Quick Stash button if OCR confirms it is present."""
+        store_text = self.lang.WarehouseTransferTask.k_d661f6da
+        self.next_frame()
+        frame = self.executor.frame
+        if frame is None:
+            return
+        h, w = frame.shape[:2]
+        store_box = (int(w * 0.625), int(h * 0.695), int(w * 0.75), int(h * 0.745))
+        if ocr_match(frame, store_box, store_text):
+            self.log_info("[store] fallback: clicking Quick Stash")
+            self.click_relative(0.67, 0.718)
+
+    def _do_deposit(self):
+        """Deposit EVERY withdrawn stack at the current (destination) depot.
+
+        Some items stack tiny in the backpack (Dense Originium Powder:
+        50/cell - one ~1.7K withdrawal is ~34 stacks filling the whole
+        40-cell backpack), so the parent's single ctrl-click deposits
+        almost nothing and the backpack fills up over rounds. Instead:
+        ctrl-click the bottom-right-most occupied cell that is NOT in the
+        run-start baseline (the user's own items, always at the front -
+        withdrawn stacks are appended after them), re-detect, and repeat
+        until only baseline cells remain. The backpack list compacts
+        forward on removal, so below-the-fold stacks shift into view.
+        """
+        baseline = getattr(self, "_backpack_baseline", None) or set()
+        cell = int(0.0538 * self.width)
+        deposited = 0
+        prev_extra = None
+        stalls = 0
+        for i in range(45):  # backpack holds at most 40 stacks
+            cells = self._backpack_occupied_cells(
+                debug_name="deposit_backpack" if i == 0 else None)
+            extra = {rc: xy for rc, xy in cells.items() if rc not in baseline}
+            if not extra:
+                break
+            if prev_extra is not None and len(extra) >= prev_extra:
+                # Only 4x5 cells are visible of the 40-cell backpack; while
+                # below-the-fold stacks compact into view the visible count
+                # stays constant for up to 20 perfectly good deposits, so a
+                # genuine stall is only >20 clicks without shrinkage.
+                stalls += 1
+                if stalls > 20:
+                    self.log_info(f"[store] deposit stalled with {len(extra)} "
+                                  f"stack(s) left, trying Quick Stash")
+                    self._quick_stash_fallback()
+                    break
+            else:
+                stalls = 0
+            prev_extra = len(extra)
+            rc = max(extra)  # bottom-right-most = newest appended stack
+            cx, cy = extra[rc]
+            self.log_info(f"[store] depositing stack at cell {rc} ({cx},{cy}), "
+                          f"{len(extra)} to go")
+            self._ctrl_click(Box(cx - cell // 2, cy - cell // 2, cell, cell,
+                                 name="backpack_item"))
+            deposited += 1
+            self.sleep(0.2)
+
+        if deposited == 0:
+            # Nothing beyond baseline detected - legacy fallbacks: fixed
+            # bottom-right cell position, then OCR-gated Quick Stash.
+            self.log_info("[store] no non-baseline stack detected, "
+                          "ctrl-clicking fixed position")
+            cx = int(0.8430 * self.width)
+            cy = int(0.6301 * self.height)
+            self._ctrl_click(Box(cx - cell // 2, cy - cell // 2, cell, cell,
+                                 name="backpack_fixed"))
+            self._quick_stash_fallback()
+        else:
+            self.log_info(f"[store] deposited {deposited} stack(s)")
+        # Deposit usually has NO confirm dialog - never blind-click
+        self._maybe_click_confirm(positional_fallback=False)
 
     # ---------- transfer ----------
 
@@ -269,6 +410,7 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
         """
         limit = _DEPOT_LIMITS[to_key]
         moved_total = 0
+        recovered = False
         for _ in range(_MAX_ROUNDS_PER_ITEM):
             if src_count <= _SOURCE_MIN:
                 self.log_info(f"[transfer] '{item}': source down to ~{src_count}, done")
@@ -301,8 +443,18 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
                 # after == before -> nothing withdrawn; after == 0 -> OCR failed
             if before > 0 and same and after == before:
                 self.log_info(f"[transfer] '{item}': cell count unchanged after "
-                              f"ctrl-click (backpack full?), stopping this item")
-                break  # nothing entered the backpack - no deposit needed
+                              f"ctrl-click (backpack full?)")
+                if not recovered:
+                    # Leftover stacks from an incomplete deposit may be
+                    # clogging the backpack - flush them once, then retry
+                    recovered = True
+                    self.log_info(f"[transfer] '{item}': recovery deposit at {to_key}")
+                    self._switch_location(to_key)
+                    self._do_deposit()
+                    continue
+                self.log_info(f"[transfer] '{item}': still stuck after recovery "
+                              f"deposit, stopping this item")
+                break
 
             self._switch_location(to_key)
             self._do_deposit()
@@ -345,6 +497,13 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
             time_out=5,
             raise_if_not_found=False,
         )
+
+        # Baseline: the user's own backpack items (always at the front of
+        # the backpack grid). Deposits only touch cells BEYOND these.
+        self._backpack_baseline = set(self._backpack_occupied_cells(
+            debug_name="backpack_baseline").keys())
+        self.log_info(f"[run] backpack baseline cells: "
+                      f"{sorted(self._backpack_baseline)}")
 
         # Phase 1: inventory (current depot first to save one switch)
         current = self._detect_current_location()
