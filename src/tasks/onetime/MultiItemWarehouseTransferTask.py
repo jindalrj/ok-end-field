@@ -115,13 +115,19 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
         return item_to_warehouse_dict.get(zh, "")
 
     def _scroll_grid_to_top(self):
-        """Scroll the item grid back to the top (3 page-up scrolls)."""
+        """Scroll the item grid back to the top (10 page-up scrolls).
+
+        The game RETAINS the grid scroll position across depot switches,
+        so every scan that assumes row 0 is at the top must first scroll
+        all the way up. 10 pages is enough to undo the deepest scan
+        (inventory caps at 12 pages; real lists are far shorter).
+        """
         w, h = self.width, self.height
         x = int((self._GRID_LEFT + (self._GRID_RIGHT - self._GRID_LEFT) / 2) * w)
         y = int((self._GRID_TOP + (self._GRID_BOTTOM - self._GRID_TOP) / 2) * h)
         self._hover_absolute(x, y)
         self.sleep(0.2)
-        for _ in range(3):
+        for _ in range(10):
             self._scroll_precise(x, y, 230)
             self.sleep(0.4)
         self.next_frame()
@@ -274,6 +280,9 @@ class MultiItemWarehouseTransferTask(WarehouseTransferTask):
             if self._detect_current_location() != from_key:
                 self._switch_location(from_key)
             self._to_one_type_page(item)
+            # Scroll position is retained across depot switches - reset it,
+            # _scan_grid_for_item only scrolls DOWN from wherever it starts
+            self._scroll_grid_to_top()
             icon = self._scan_grid_for_item(item)
             if not icon:
                 self.log_info(f"[transfer] '{item}': no longer found in source, done")
